@@ -47,6 +47,7 @@ from gymnasium import spaces
 
 from lowlevel_client import LowLevelClient
 from reward import RewardWeights, compute_reward
+from control_safety import REQUIRED_STATE_HEALTH, UnsafeState, require_ack, validate_state
 from pendulum_env import (
     MAX_ACTION_DELTA_RAD,
     MOTOR_LIMIT_RAD,
@@ -93,7 +94,7 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
         port: str = "/dev/cu.usbserial-110",
         baud: int = 2_000_000,
         control_freq_hz: float = 50.0,  # canonical for this rig — see website/src/content/docs/reference/control-rate.md
-        action_mode: str = "accel",  # "accel", "velocity", or "position_delta" — must match sim training
+        action_mode: str = "velocity",  # must match sim training
         max_accel_rad_s2: float = 100.0,
         max_velocity_rad_s: float = 3.5,  # velocity-mode action scale; matches sim MAX_VELOCITY_RAD_S
         max_action_delta_rad: float = MAX_ACTION_DELTA_RAD,  # position-mode per-step target delta
@@ -137,12 +138,14 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
         # mirror of pendulum_env's action_smooth_window and of
         # ACTION_SMOOTH_WINDOW in RLControl.ino. Must match sim training.
         action_smooth_window: int = 4,
+        max_state_age_s: float = 0.080,
+        required_health_mask: int = REQUIRED_STATE_HEALTH,
         params_path: str | Path | None = None,
     ):
         super().__init__()
-        if action_mode not in ("accel", "velocity", "position_delta"):
+        if action_mode not in ("accel", "velocity"):
             raise ValueError(
-                f"action_mode must be 'accel', 'velocity', or 'position_delta', "
+                f"action_mode must be 'accel' or 'velocity' for protocol v1, "
                 f"got {action_mode!r}"
             )
         self.port = port
@@ -157,6 +160,13 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
                 f"action_smooth_window must be >= 1, got {action_smooth_window}"
             )
         self.action_smooth_window = int(action_smooth_window)
+        if max_state_age_s <= 0:
+            raise ValueError("max_state_age_s must be positive")
+        self.max_state_age_s = float(max_state_age_s)
+        self.required_health_mask = int(required_health_mask)
+        self._last_state_age_ms = math.inf
+        self._last_state_rtt_ms = math.inf
+        self._last_command_rtt_ms = math.inf
         self._action_smooth_buf: deque = deque(
             [0.0] * self.action_smooth_window, maxlen=self.action_smooth_window
         )
@@ -257,7 +267,7 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
         self._sigterm_received = True
         try:
             if self._client is not None:
-                self._client.disengage_motor()
+                self._client.disarm()
         except Exception:
             pass
 
@@ -273,7 +283,18 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
         return self._client
 
     def _read_raw_state(self):
-        s = self._client.get_state()  # type: ignore[union-attr]
+        try:
+            s = self._client.get_state()  # type: ignore[union-attr]
+            age = validate_state(
+                s,
+                max_age_s=self.max_state_age_s,
+                required_health_mask=self.required_health_mask,
+            )
+        except Exception:
+            self.disengage_safely()
+            raise
+        self._last_state_age_ms = age.age_ns / 1e6
+        self._last_state_rtt_ms = age.rtt_ns / 1e6
         return (s.time_us, s.motor_pos_rad, s.pendulum_pos_rad,
                 s.motor_vel_rad_s, s.pendulum_vel_rad_s)
 
@@ -379,7 +400,7 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
         # was unreliable: hard-spun pendulums can still oscillate after 3 s.
         # Taring a moving pendulum captures a non-rest sample as the new
         # encoder zero, polluting the bias signal we rely on.
-        client.disengage_motor()
+        client.disarm()
         self._motor_engaged = False
         print("  [reset] re-centre the arm and let the pendulum settle — the "
               "next episode starts once it is at rest")
@@ -432,29 +453,10 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
                 if not client.tare_pendulum():
                     raise RuntimeError("tare_pendulum did not ack on re-tare")
 
-        # Read current state, engage, then prime the firmware's command state.
-        # Priming must come AFTER engage: the firmware drops SET_ACCEL /
-        # SET_TARGET while disengaged (motor_engaged gate). Engage itself
-        # holds the stepper at zero speed, so there is no motion in between.
-        # Accel-mode: command zero acceleration. Position-mode: seed the
-        # integrated target at the current position (moveTo(current) = hold).
+        # Reset deliberately leaves the driver disarmed. Arming is a separate
+        # explicit operation and must only be called after operator approval.
         _, motor_pos, phi, _, _ = self._read_raw_state()
-        client.engage_motor()
-        self._motor_engaged = True
-
-        # The step counter is open-loop, so re-zero it now the operator has
-        # re-centred the arm; otherwise the stale position drifts further every
-        # episode until it trips the hard-stop check.
-        if not client.zero_motor():
-            raise RuntimeError("zero_motor did not ack — firmware older "
-                               "than CMD_ZERO_MOTOR (0x08)?")
-        motor_pos = 0.0
-
-        if self.action_mode == "accel":
-            client.set_acceleration(0.0)
-        else:
-            self._motor_target = float(motor_pos)
-            client.set_target(self._motor_target)
+        self._motor_target = float(motor_pos)
 
         self._motor_pos_prev = motor_pos
         self._phi_prev = phi
@@ -470,6 +472,25 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
 
         self._obs_history.clear()  # reseeded by _build_obs with the initial frame
         return self._build_obs(motor_pos, phi), {}
+
+    @property
+    def is_armed(self) -> bool:
+        return self._motor_engaged
+
+    def arm(self) -> None:
+        """Arm only on an explicit operator-authorized call; reset never arms."""
+        client = self._ensure_open()
+        if self._motor_engaged:
+            return
+        self._read_raw_state()
+        try:
+            require_ack(client.arm(), operation="ARM")
+            self._motor_engaged = True
+            ack = require_ack(client.set_acceleration(0.0), operation="initial SET_ACCEL")
+            self._last_command_rtt_ms = int(ack.rtt_ns) / 1e6
+        except Exception:
+            self.disengage_safely()
+            raise
 
     def apply_action(self, action) -> float:
         """Send `action` to the motor, interpreted per `action_mode`.
@@ -489,7 +510,11 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
         if client is None or not self._motor_engaged:
             raise RuntimeError("env.apply_action() called before reset() or motor disengaged")
 
-        a = float(np.clip(np.asarray(action).flatten()[0], -1.0, 1.0))
+        action_values = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action_values.size != 1 or not np.isfinite(action_values[0]):
+            self.disengage_safely()
+            raise UnsafeState("policy action must be one finite scalar")
+        a = float(np.clip(action_values[0], -1.0, 1.0))
         # Actuator-side smoothing: the motor chases the boxcar average of
         # the last N actions; the RAW action still goes to the reward and
         # replay buffer (return value below), mirroring pendulum_env.
@@ -523,20 +548,20 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
             elif self._motor_pos_prev <= -MOTOR_SAFE_LIMIT_RAD and accel_cmd < 0.0:
                 accel_cmd = 0.0
             self._last_accel_cmd = accel_cmd
-            client.set_acceleration(accel_cmd)
+            try:
+                ack = require_ack(client.set_acceleration(accel_cmd), operation="SET_ACCEL")
+                self._last_command_rtt_ms = int(ack.rtt_ns) / 1e6
+            except Exception:
+                self.disengage_safely()
+                raise
             if self.action_mode == "velocity":
                 self._v_cmd = float(np.clip(
                     self._v_cmd + accel_cmd / self.control_freq_hz,
                     -self.max_velocity_rad_s, self.max_velocity_rad_s,
                 ))
                 self._v_cmd += 0.1 * (self._motor_vel - self._v_cmd)
-        else:
-            self._motor_target = float(np.clip(
-                self._motor_target + a_cmd * self.max_action_delta_rad,
-                -MOTOR_SAFE_LIMIT_RAD,
-                MOTOR_SAFE_LIMIT_RAD,
-            ))
-            client.set_target(self._motor_target)
+        else:  # guarded in __init__; retained as a defensive invariant
+            raise RuntimeError("protocol v1 supports acceleration commands only")
         self._prev_action = a
         return a
 
@@ -550,7 +575,8 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
         """
         try:
             t_us, motor_pos, phi, motor_vel, pen_vel = self._read_raw_state()
-        except OSError:
+        except Exception:
+            self.disengage_safely()
             return (self._build_obs(self._motor_pos_prev, self._phi_prev,
                                     push=False), 0.0, True, False, {})
 
@@ -572,6 +598,9 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
             "accel_cmd_rad_s2": getattr(self, "_last_accel_cmd", 0.0),
             "motor_target_rad": self._motor_target,
             "time_us": int(t_us),
+            "state_age_ms": self._last_state_age_ms,
+            "state_rtt_ms": self._last_state_rtt_ms,
+            "command_rtt_ms": self._last_command_rtt_ms,
         }
 
         self._motor_pos_prev = motor_pos
@@ -589,8 +618,8 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
         """
         try:
             a = self.apply_action(action)
-        except OSError:
-            # Serial syscall interrupted during set_acceleration — treat as termination.
+        except Exception:
+            self.disengage_safely()
             return (self._build_obs(self._motor_pos_prev, self._phi_prev,
                                     push=False), 0.0, True, False, {})
 
@@ -617,7 +646,7 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
         """
         try:
             if self._client is not None:
-                self._client.disengage_motor()
+                self._client.disarm()
                 self._motor_engaged = False
         except Exception:
             pass
@@ -625,7 +654,7 @@ class RealRotaryInvertedPendulumEnv(gym.Env):
     def close(self):
         if self._client is not None:
             try:
-                self._client.disengage_motor()
+                self._client.disarm()
             except Exception:
                 pass
             self._client.__exit__(None, None, None)

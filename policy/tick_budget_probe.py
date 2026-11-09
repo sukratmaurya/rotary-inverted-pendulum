@@ -6,12 +6,10 @@ breakdown of every component:
 
     get_state:  serial round-trip (Python write → Arduino reply)
     inference:  policy.predict()  (or a dummy callable)
-    set_accel:  serial write
     total:      end-to-end tick wall time
     sleep_jit:  difference between intended next-tick time and actual wake
 
-We send `set_acceleration(0.0)` only (motor disengaged), so the rig
-isn't disturbed. Pure I/O + compute measurement.
+The driver remains disarmed, so this measures state-read and compute costs.
 
 Usage:
     # With a real policy
@@ -152,8 +150,9 @@ def main(argv: list[str] | None = None) -> int:
             prev_action = float(action[0])
             t2 = time.monotonic()
 
-            client.set_acceleration(0.0)  # safe, motor disengaged anyway
-            t3 = time.monotonic()
+            # Do not arm merely to benchmark an acceleration-command write.
+            # This probe intentionally measures state-read and inference only.
+            t3 = t2
 
             t_get[i]   = t1 - t0
             t_inf[i]   = t2 - t1
@@ -186,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Per-tick component breakdown:")
     _print_row("get_state",  _percentiles(t_get))
     _print_row("inference",  _percentiles(t_inf))
-    _print_row("set_accel",  _percentiles(t_set))
+    print("  set_accel: not measured (driver intentionally disarmed)")
     _print_row("total tick", _percentiles(t_total))
     if args.control_hz is not None:
         print()

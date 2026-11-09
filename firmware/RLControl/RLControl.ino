@@ -44,21 +44,18 @@
  *   - motor_pos = 0 at engage (stepper position re-zeroed).
  *
  * Boot procedure:
- *   1. Power on or finish flashing. The sketch waits for a valid AS5600
- *      magnet detection, then waits a 1 s settle delay before engaging.
- *      The pose at the END of that delay becomes the policy's frame
- *      (phi = 0 = current pendulum angle, motor_pos = 0 = current
- *      stepper position). UX: have the pendulum hanging straight down
- *      before / during the 1 s delay; the LED is solid HIGH then drops
- *      to LOW once the motor engages.
- *   2. The policy runs; it swings up and balances.
- *   3. If the motor reaches a hard limit, the sketch disengages and waits.
- *      Press 'E' (after re-positioning) to re-engage with a fresh frame.
+ *   1. Boot/reset leaves driver outputs disabled and policy WAITING.
+ *   2. An operator must send 'E' after checking the rig and encoder; no timer,
+ *      USB open, or reset path automatically enables the motor.
+ *   3. Faults latch in FAULT and require 'C' clear, then a separate 'E' arm
+ *      after encoder and position health checks pass.
  *
- * Serial commands (500 kbaud, optional — the sketch is fully autonomous):
+ * Serial commands (500 kbaud):
  *   'P' / 'p' : toggle CSV telemetry
- *   'E' / 'e' : engage motor (re-arm after a hard-limit trip)
+ *   'E' / 'e' : explicit arm from a healthy WAITING state
  *   'D' / 'd' : disengage motor (manual stop)
+ *   'C' / 'c' : clear a latched fault if sensor/position are healthy; a
+ *               separate 'E' command is still required to arm afterwards
  *   'M' / 'm' : print AS5600 magnet diagnostics
  *
  * Telemetry CSV (when toggled on, one line per control tick):
@@ -72,6 +69,9 @@
 #include <FastAccelStepper.h>
 #include <AS5600.h>
 #include <Wire.h>
+#include <math.h>
+#include <stdlib.h>
+#include "ControlTiming.h"
 
 // Which champion header to compile. Named policy_weights_<rig>_<driver>_<microsteps>.h:
 // the rig because each one is fine-tuned against its own measured friction, the
@@ -85,6 +85,9 @@
 #define POLICY_WEIGHTS_H "policy_weights_rig1_tmc2209_32.h"
 #endif
 #include POLICY_WEIGHTS_H
+
+static_assert(sizeof(float) == 4,
+              "deployed student policy requires 32-bit float activations");
 
 // =============================================================================
 // PINS
@@ -141,6 +144,11 @@ const int32_t MOTOR_BRAKE_ACCEL_STEPS_S2 =
 const float CONTROL_FREQUENCY_HZ = 50.0f;
 const unsigned long CONTROL_PERIOD_US = (unsigned long)(1000000.0f / CONTROL_FREQUENCY_HZ);
 const float CONTROL_DT_S = 1.0f / CONTROL_FREQUENCY_HZ;
+// The simulator randomizes control-period duration by ±5% when enabled.
+// Preserve the fixed-rate controller math and allow at most that much
+// scheduler lateness; a larger miss faults instead of applying a stale,
+// stretched-period action.
+const uint32_t CONTROL_MAX_LATENESS_US = CONTROL_PERIOD_US / 20UL;
 
 // Velocity-mode action scaling — must match training config.json:
 //   max_velocity_rad_s = 3.5 (action scale), max_accel_rad_s2 = 150.
@@ -183,8 +191,10 @@ const float MOTOR_HARD_LIMIT_RAD = 2.30383f;   // 132° × π/180
 // policy was trained and fine-tuned on exactly these statistics.
 // =============================================================================
 const uint16_t SAMPLE_PERIOD_US = 2000;
-const uint8_t SAMPLE_BUFFER_SIZE = 16;
 const uint8_t VEL_WINDOW = 5;
+// Only the latest VEL_WINDOW samples are consumed by the estimator. A larger
+// history ring has no behavioral effect and costs 12 bytes per extra sample.
+const uint8_t SAMPLE_BUFFER_SIZE = VEL_WINDOW;
 
 static int32_t motor_step_buf[SAMPLE_BUFFER_SIZE];
 static float pen_rad_buf[SAMPLE_BUFFER_SIZE];
@@ -202,8 +212,29 @@ FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepper = NULL;
 AS5600 as5600;
 
-enum State { WAITING, RUNNING };
+enum State { WAITING, RUNNING, FAULT };
 State state = WAITING;
+static uint8_t latched_fault_code = 0;
+static bool fault_origin_rezeroed = false;
+static bool encoder_data_valid = false;
+static bool encoder_magnet_ok = false;
+static uint8_t consecutive_bad_encoder_samples = 0;
+static uint32_t last_valid_encoder_us = 0;
+static uint32_t last_magnet_check_ms = 0;
+static long encoder_raw_current = -1;
+static long frozen_encoder_reference_raw = -1;
+static int32_t frozen_encoder_reference_motor_steps = 0;
+static uint32_t frozen_encoder_reference_ms = 0;
+static uint32_t last_control_start_us = 0;
+static const uint32_t ENCODER_STALE_US = 10000UL;
+static const uint32_t MAGNET_CHECK_MS = 100UL;
+static const int32_t FROZEN_ENCODER_MOTOR_TRAVEL_STEPS = 6400;
+static const uint32_t FROZEN_ENCODER_CONFIRM_MS = 1000UL;
+static const uint8_t FAULT_ENCODER_STALE = 2;
+static const uint8_t FAULT_ENCODER_FROZEN = 4;
+static const uint8_t FAULT_ENCODER_INVALID = 8;
+static const uint8_t FAULT_HARD_LIMIT = 0x10;
+static const uint8_t FAULT_CONTROL_OVERRUN = 0x20;
 
 // Observation frame ring: frames[0] = oldest ... frames[OBS_FRAMES-1] = newest.
 static float frames[OBS_FRAMES][FRAME_DIM];
@@ -224,7 +255,6 @@ static uint8_t a_smooth_idx = 0;
 // Telemetry / diagnostics
 unsigned int loop_overruns = 0;
 unsigned int loop_count_for_freq = 0;
-unsigned long prev_time_us = 0;
 bool print_enabled = false;
 float last_action = 0.0f;
 
@@ -261,6 +291,36 @@ static void reset_pendulum_tracking()
     _encoder_zero_pending = true;
 }
 
+static void latch_fault(uint8_t code)
+{
+    if (code == 0) code = FAULT_CONTROL_OVERRUN;
+    latched_fault_code |= code;
+    if (code & FAULT_HARD_LIMIT) fault_origin_rezeroed = false;
+    if (stepper != NULL)
+    {
+        stepper->forceStop();
+        stepper->disableOutputs();
+    }
+    state = FAULT;
+    v_cmd = 0.0f;
+    last_action = 0.0f;
+    tele_motor_vel = 0.0f;
+    tele_pen_vel = 0.0f;
+    for (uint8_t i = 0; i < ACTION_SMOOTH_WINDOW; ++i) a_smooth_ring[i] = 0.0f;
+    a_smooth_idx = 0;
+}
+
+static bool encoder_ready()
+{
+    uint8_t n_samples = buf_filled ? SAMPLE_BUFFER_SIZE : buf_head;
+    uint32_t now_us = micros();
+    encoder_magnet_ok = as5600.detectMagnet();
+    last_magnet_check_ms = millis();
+    return stepper != NULL && encoder_magnet_ok && encoder_data_valid &&
+           n_samples >= VEL_WINDOW && last_valid_encoder_us != 0 &&
+           (uint32_t)(now_us - last_valid_encoder_us) <= ENCODER_STALE_US;
+}
+
 static float read_pendulum_rad()
 {
     const long AS5600_RES = 4096;
@@ -272,12 +332,28 @@ static float read_pendulum_rad()
     static float pos = 0.0f;
 
     long raw = (long)as5600.rawAngle();
+    // rawAngle() masks its uint16_t return to 12 bits, including on failed
+    // I2C reads. Preserve the library error before accepting the value.
+    if (as5600.lastError() != AS5600_OK) raw = -1;
+    encoder_raw_current = raw;
+
+    if (raw < 0 || raw >= 4096)
+    {
+        encoder_data_valid = false;
+        if (consecutive_bad_encoder_samples < 255) ++consecutive_bad_encoder_samples;
+        if (state == RUNNING && consecutive_bad_encoder_samples >= 3)
+            latch_fault(FAULT_ENCODER_INVALID);
+        return pos;
+    }
 
     if (_encoder_zero_pending)
     {
         raw_prev = raw;
         pos = 0.0f;
         _encoder_zero_pending = false;
+        encoder_data_valid = true;
+        consecutive_bad_encoder_samples = 0;
+        last_valid_encoder_us = micros();
         return 0.0f;
     }
 
@@ -290,11 +366,18 @@ static float read_pendulum_rad()
     // flailing against a false vertical). Same guard as LowLevelServer.
     if (delta > PEN_RAW_MAX_DELTA_LSB || delta < -PEN_RAW_MAX_DELTA_LSB)
     {
+        encoder_data_valid = false;
+        if (consecutive_bad_encoder_samples < 255) ++consecutive_bad_encoder_samples;
+        if (state == RUNNING && consecutive_bad_encoder_samples >= 3)
+            latch_fault(FAULT_ENCODER_INVALID);
         return pos;
     }
 
     pos += (float)delta * RAD_PER_SEG;
     raw_prev = raw;
+    encoder_data_valid = true;
+    consecutive_bad_encoder_samples = 0;
+    last_valid_encoder_us = micros();
     return pos;
 }
 
@@ -317,11 +400,35 @@ static void update_sample_buffer()
     if ((uint32_t)(now_us - last_sample_us) < SAMPLE_PERIOD_US) return;
     last_sample_us = now_us;
 
-    motor_step_buf[buf_head] = stepper->getCurrentPosition();
+    int32_t motor_steps = stepper->getCurrentPosition();
+    motor_step_buf[buf_head] = motor_steps;
     pen_rad_buf[buf_head] = read_pendulum_rad();
     time_us_buf[buf_head] = now_us;
     buf_head = (buf_head + 1) % SAMPLE_BUFFER_SIZE;
     if (buf_head == 0) buf_filled = true;
+
+    uint32_t now_ms = millis();
+    if ((uint32_t)(now_ms - last_magnet_check_ms) >= MAGNET_CHECK_MS)
+    {
+        encoder_magnet_ok = as5600.detectMagnet();
+        last_magnet_check_ms = now_ms;
+    }
+    if (state == RUNNING && !encoder_magnet_ok)
+        latch_fault(FAULT_ENCODER_INVALID);
+
+    if (frozen_encoder_reference_raw < 0 || encoder_raw_current != frozen_encoder_reference_raw)
+    {
+        frozen_encoder_reference_raw = encoder_raw_current;
+        frozen_encoder_reference_motor_steps = motor_steps;
+        frozen_encoder_reference_ms = now_ms;
+    }
+    else if (state == RUNNING && encoder_data_valid &&
+             labs((long)motor_steps - (long)frozen_encoder_reference_motor_steps) >=
+                 FROZEN_ENCODER_MOTOR_TRAVEL_STEPS &&
+             (uint32_t)(now_ms - frozen_encoder_reference_ms) >= FROZEN_ENCODER_CONFIRM_MS)
+    {
+        latch_fault(FAULT_ENCODER_FROZEN);
+    }
 }
 
 // Timestamp of the sample the policy actually read. Paired with the micros()
@@ -330,6 +437,7 @@ static void update_sample_buffer()
 static uint32_t used_sample_us = 0;
 static uint16_t latency_us = 0;
 static uint16_t latency_max_us = 0;
+static ControlTiming::FixedRateScheduler control_scheduler;
 
 /** GET_STATE-equivalent snapshot: newest positions + window-diff velocities. */
 static void read_measured_state(float* motor_pos, float* phi,
@@ -472,8 +580,13 @@ static void prime_initial_state()
     reset_sample_buffer();
 }
 
-static void transition_to_running()
+static bool transition_to_running()
 {
+    if (state == FAULT || latched_fault_code != 0 || !encoder_ready()) return false;
+    // Do not erase evidence of a rail excursion before deciding whether an
+    // operator may re-arm. The arm origin is reset only after this check.
+    if (fabsf(read_motor_pos_rad()) >= MOTOR_SAFE_LIMIT_RAD) return false;
+
     // Recapture both the encoder zero (phi=0 ↔ current pendulum position)
     // and the stepper origin (motor_pos=0 ↔ current motor position) so the
     // policy sees the same frame conventions it was trained in regardless
@@ -481,8 +594,14 @@ static void transition_to_running()
     reset_pendulum_tracking();
     stepper->setCurrentPosition(0);
     prime_initial_state();
+    if (!encoder_data_valid || !encoder_magnet_ok) return false;
+    frozen_encoder_reference_raw = encoder_raw_current;
+    frozen_encoder_reference_motor_steps = stepper->getCurrentPosition();
+    frozen_encoder_reference_ms = millis();
     stepper->enableOutputs();
     state = RUNNING;
+    last_control_start_us = micros();
+    return true;
 }
 
 static void transition_to_waiting()
@@ -490,6 +609,21 @@ static void transition_to_waiting()
     stepper->forceStop();
     stepper->disableOutputs();
     state = WAITING;
+    v_cmd = 0.0f;
+    last_action = 0.0f;
+    for (uint8_t i = 0; i < ACTION_SMOOTH_WINDOW; ++i) a_smooth_ring[i] = 0.0f;
+    a_smooth_idx = 0;
+}
+
+static bool clear_latched_fault()
+{
+    if (state != FAULT || latched_fault_code == 0 || !encoder_ready()) return false;
+    if ((latched_fault_code & FAULT_HARD_LIMIT) && !fault_origin_rezeroed) return false;
+    if (fabsf(read_motor_pos_rad()) >= MOTOR_SAFE_LIMIT_RAD) return false;
+    latched_fault_code = 0;
+    fault_origin_rezeroed = false;
+    state = WAITING;
+    return true;
 }
 
 // =============================================================================
@@ -502,11 +636,25 @@ static void control_tick()
     float motor_pos, phi, motor_vel, pen_vel;
     read_measured_state(&motor_pos, &phi, &motor_vel, &pen_vel);
 
+    if (state != RUNNING) return;  // sampler may have latched a sensor fault
+    if (!encoder_data_valid || !encoder_magnet_ok || last_valid_encoder_us == 0 ||
+        (uint32_t)(micros() - last_valid_encoder_us) > ENCODER_STALE_US)
+    {
+        latch_fault(FAULT_ENCODER_STALE);
+        return;
+    }
+    if (!ControlTiming::timestamp_is_fresh(micros(), used_sample_us,
+                                           ENCODER_STALE_US))
+    {
+        latch_fault(FAULT_ENCODER_STALE);
+        return;
+    }
+
     // 2. Hard-limit safety: trip back to WAITING if the motor strayed past
     // the mechanical envelope.
     if (fabs(motor_pos) > MOTOR_HARD_LIMIT_RAD)
     {
-        transition_to_waiting();
+        latch_fault(FAULT_HARD_LIMIT);
         return;
     }
 
@@ -525,6 +673,20 @@ static void control_tick()
     // frames[][] is contiguous, so it IS the obs vector.
     float action;
     policy_forward(&frames[0][0], &action);
+    if (state != RUNNING) return;
+    // Sampling continues during inference, but the policy's observation is
+    // the snapshot captured above. Check that snapshot itself (and the most
+    // recent successful sensor read) are still fresh before using its action.
+    uint32_t command_time_us = micros();
+    if (!encoder_data_valid || !encoder_magnet_ok ||
+        !ControlTiming::timestamp_is_fresh(command_time_us, used_sample_us,
+                                           ENCODER_STALE_US) ||
+        !ControlTiming::timestamp_is_fresh(command_time_us, last_valid_encoder_us,
+                                           ENCODER_STALE_US))
+    {
+        latch_fault(FAULT_ENCODER_STALE);
+        return;
+    }
     if (action > 1.0f) action = 1.0f;
     else if (action < -1.0f) action = -1.0f;
     last_action = action;
@@ -572,7 +734,17 @@ static void control_tick()
     {
         accel_steps_s2 = +MOTOR_BRAKE_ACCEL_STEPS_S2;
     }
-    latency_us = (uint16_t)(micros() - used_sample_us);
+    command_time_us = micros();
+    if (!encoder_data_valid || !encoder_magnet_ok ||
+        !ControlTiming::timestamp_is_fresh(command_time_us, used_sample_us,
+                                           ENCODER_STALE_US) ||
+        !ControlTiming::timestamp_is_fresh(command_time_us, last_valid_encoder_us,
+                                           ENCODER_STALE_US))
+    {
+        latch_fault(FAULT_ENCODER_STALE);
+        return;
+    }
+    latency_us = (uint16_t)(command_time_us - used_sample_us);
     if (latency_us > latency_max_us) latency_max_us = latency_us;
 
     stepper->moveByAcceleration(accel_steps_s2, true);
@@ -590,8 +762,33 @@ static void handle_serial()
     switch (cmd)
     {
     case 'P': case 'p': print_enabled = !print_enabled; break;
-    case 'E': case 'e': if (state == WAITING) transition_to_running(); break;
-    case 'D': case 'd': if (state == RUNNING) transition_to_waiting(); break;
+    case 'E': case 'e':
+        if (state == WAITING && transition_to_running()) digitalWrite(LED_BUILTIN, LOW);
+        break;
+    case 'D': case 'd':
+        if (state == RUNNING) transition_to_waiting();
+        break;
+    case 'C': case 'c':
+        // Clearing a fault never arms. The operator must send a separate E.
+        if (clear_latched_fault()) digitalWrite(LED_BUILTIN, HIGH);
+        break;
+    case 'Z': case 'z':
+        // After a hard-limit stop, the operator must first move the arm back
+        // to its documented centre by hand with outputs disabled, then issue
+        // Z to establish that point as the new step-counter origin. This is
+        // an explicit confirmation, not an absolute motor-position reading.
+        if (state == FAULT && encoder_ready())
+        {
+            noInterrupts();
+            stepper->setCurrentPosition(0);
+            for (uint8_t i = 0; i < SAMPLE_BUFFER_SIZE; ++i) motor_step_buf[i] = 0;
+            interrupts();
+            frozen_encoder_reference_raw = encoder_raw_current;
+            frozen_encoder_reference_motor_steps = 0;
+            frozen_encoder_reference_ms = millis();
+            fault_origin_rezeroed = true;
+        }
+        break;
     case 'M': case 'm':
         Serial.print(F("[AS5600] magnet="));
         if (as5600.magnetTooWeak()) Serial.println(F("WEAK"));
@@ -684,6 +881,9 @@ void setup()
     Serial.begin(SERIAL_BAUD_RATE);
     Wire.begin();
     Wire.setClock(I2C_CLOCK_HZ);
+    // Avoid unbounded TWI waits on a stuck/disconnected sensor bus. Sampling
+    // and fault checks continue after the bounded timeout.
+    Wire.setWireTimeout(3000, true);
     as5600.begin();
 
     pinMode(LED_BUILTIN, OUTPUT);
@@ -720,10 +920,11 @@ void setup()
     stepper->setForwardPlanningTimeInMs(8);
     stepper->disableOutputs();
 
-    while (!as5600.detectMagnet())
-    {
-        delay(500);
-    }
+    // Boot remains safe and responsive without the magnet. Sensor health is
+    // checked continuously; arming is refused until the sampler is healthy.
+    encoder_magnet_ok = as5600.detectMagnet();
+    last_magnet_check_ms = millis();
+    reset_sample_buffer();
 
     // Forward-pass self-test: compute the action for a fixed reference obs
     // and print it. Compare against the PyTorch student's prediction for
@@ -746,16 +947,10 @@ void setup()
         Serial.println(test_act, 6);
     }
 
-    // 1 s settle delay before engaging — gives the user a moment to verify
-    // the pendulum is hanging straight down (LED stays HIGH during the
-    // delay). Whatever pose the rig is in at the END of this delay
-    // becomes the policy's frame (encoder zero + stepper origin captured
-    // by transition_to_running).
-    delay(1000);
-    digitalWrite(LED_BUILTIN, LOW);
-    transition_to_running();
+    // No automatic engagement after boot or serial reset. Keep outputs disabled
+    // until an operator sends the explicit E command from a healthy state.
 
-    prev_time_us = micros();
+    control_scheduler.begin(micros());
 }
 
 void loop()
@@ -767,25 +962,42 @@ void loop()
     service_telemetry();
 
     unsigned long now_us = micros();
-    unsigned long elapsed_us = now_us - prev_time_us;
-    if (elapsed_us < CONTROL_PERIOD_US)
+    if (state == RUNNING &&
+        (uint32_t)(now_us - last_valid_encoder_us) > ENCODER_STALE_US)
+        latch_fault(FAULT_ENCODER_STALE);
+    if (state == RUNNING &&
+        (uint32_t)(now_us - last_control_start_us) > 3UL * CONTROL_PERIOD_US)
+        latch_fault(FAULT_CONTROL_OVERRUN);
+
+    ControlTiming::Decision tick_decision = control_scheduler.poll(
+        now_us, CONTROL_PERIOD_US, CONTROL_MAX_LATENESS_US);
+    if (tick_decision == ControlTiming::WAIT_FOR_DEADLINE)
     {
         return;
     }
 
-    if (elapsed_us > CONTROL_PERIOD_US * 3UL / 2UL)
+    if (tick_decision == ControlTiming::REJECT_LATE_TICK)
     {
         loop_overruns++;
+        // Fixed 20 ms control math is valid only near the trained update rate.
+        // Do not execute policy/controller math for a stretched period.
+        if (state == RUNNING) latch_fault(FAULT_CONTROL_OVERRUN);
     }
 
-    prev_time_us = now_us;
+    // The scheduler consumes one slot and rebases: there is never a catch-up
+    // burst. A late running tick above faults and is skipped; no control
+    // timestamp/lease is refreshed on that path.
     loop_count_for_freq++;
 
-    handle_serial();
+    // Do not accept an ARM command on a rejected/late schedule slot. It will
+    // be serviced at the next nominal tick, which can then run the first
+    // policy update without an uncommanded enabled interval.
+    if (tick_decision != ControlTiming::REJECT_LATE_TICK) handle_serial();
     update_led();
 
-    if (state == RUNNING)
+    if (state == RUNNING && tick_decision == ControlTiming::RUN_ONE_TICK)
     {
+        last_control_start_us = micros();
         control_tick();
     }
 

@@ -22,6 +22,8 @@ dependencies = [
     "pyserial",
     # STL → glTF for the documentation site's 3D demo (export_assets.py only).
     "trimesh",
+    "tqdm>=4.70.1",
+    "rich>=15.0.0",
 ]
 
 [tool.uv]

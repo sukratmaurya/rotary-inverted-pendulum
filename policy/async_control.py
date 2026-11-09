@@ -163,6 +163,9 @@ class TickStats:
     sum_dt2_ms: float = 0.0
     max_overrun_ms: float = 0.0
     n_violations: int = 0
+    max_state_age_ms: float = 0.0
+    max_state_rtt_ms: float = 0.0
+    max_command_rtt_ms: float = 0.0
 
 
 @dataclass
@@ -244,6 +247,10 @@ class AsyncControlLoop:
         disengaging the motor.
         """
         env = self.env
+        if not getattr(env, "is_armed", False):
+            raise RuntimeError(
+                "control loop requires explicit env.arm() after operator approval"
+            )
         # The orchestrator already called env.reset(); we read the current
         # state to bootstrap the obs without consuming an episode step.
         try:
@@ -270,7 +277,8 @@ class AsyncControlLoop:
                 action = self.policy.predict(obs, deterministic=self.deterministic)
                 try:
                     a_applied = env.apply_action(action)
-                except (OSError, KeyboardInterrupt):
+                except Exception:
+                    env.disengage_safely()
                     terminated = True
                     break
 
@@ -348,9 +356,19 @@ class AsyncControlLoop:
                 # 4. Observe (read state + filter velocities)
                 try:
                     next_obs, reward, terminated, truncated, info = env.observe_and_step(a_applied)
-                except (OSError, KeyboardInterrupt):
+                except Exception:
+                    env.disengage_safely()
                     terminated = True
                     break
+                stats.max_state_age_ms = max(
+                    stats.max_state_age_ms, float(info.get("state_age_ms", 0.0))
+                )
+                stats.max_state_rtt_ms = max(
+                    stats.max_state_rtt_ms, float(info.get("state_rtt_ms", 0.0))
+                )
+                stats.max_command_rtt_ms = max(
+                    stats.max_command_rtt_ms, float(info.get("command_rtt_ms", 0.0))
+                )
 
                 # 5. Post the transition for the learner thread
                 done = bool(terminated or truncated)

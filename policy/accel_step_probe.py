@@ -39,6 +39,7 @@ from pathlib import Path
 import numpy as np
 
 from lowlevel_client import LowLevelClient
+from control_safety import confirm_operator_arm
 
 
 SAFETY_POS_RAD = 1.5  # ~86° — abort if motor crosses this
@@ -209,7 +210,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="Accel values to test (rad/s²)")
     p.add_argument("--out-dir", type=str, default=None,
                    help="Output directory (default: ./accel_step_runs/<timestamp>/)")
+    p.add_argument("--arm", action="store_true",
+                   help="opt in to motor motion; requires typed ARM STEP PROBE confirmation")
     args = p.parse_args(argv)
+    if not args.arm:
+        p.error("probe is disarmed by default; pass --arm to opt in")
+    confirm_operator_arm(requested=True, phrase="ARM STEP PROBE")
 
     if args.out_dir:
         out = Path(args.out_dir)
@@ -226,7 +232,8 @@ def main(argv: list[str] | None = None) -> int:
         if not client.wait_until_ready():
             print("Arduino not responding", file=sys.stderr)
             return 1
-        client.engage_motor()
+        client.arm()
+        client.set_acceleration(0.0)
         time.sleep(0.3)
 
         for i, A in enumerate(args.accels):

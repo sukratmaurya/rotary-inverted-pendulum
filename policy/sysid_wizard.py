@@ -43,6 +43,7 @@ from pathlib import Path
 import numpy as np
 
 from lowlevel_client import LowLevelClient
+from control_safety import confirm_operator_arm
 from sysid_core import (
     DEFAULT_FREE_SWING_DURATION_S,
     DEFAULT_FREE_SWING_RUNS,
@@ -357,8 +358,8 @@ def record_motor_sweep(client: LowLevelClient, out_dir: Path) -> Path:
     print(_yellow("  Clear space around the rig; the arm will sweep ~180°."))
     _prompt_enter("  Ready")
 
+    client.arm()
     client.set_acceleration(0.0)
-    client.engage_motor()
     time.sleep(0.5)
 
     # Reset accumulator: zero out the motor position so 0 = current pose.
@@ -768,6 +769,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     def common_device(sp):
         sp.add_argument("--port", default=None, help="serial port (auto-detect if omitted)")
         sp.add_argument("--baud", type=int, default=2_000_000)
+        sp.add_argument("--arm", action="store_true",
+                        help="opt in to motor motion; requires typed confirmation")
         sp.add_argument("--out-dir", default=None,
                         help="output directory (auto-timestamped if omitted)")
 
@@ -809,6 +812,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.cmd != "fit":
+        if not args.arm:
+            raise SystemExit("hardware sysid is disarmed by default; pass --arm to opt in")
+        phrase = f"ARM SYSID {args.cmd or 'FULL'}"
+        confirm_operator_arm(requested=True, phrase=phrase)
 
     if args.cmd == "collect":
         collect_data(args)

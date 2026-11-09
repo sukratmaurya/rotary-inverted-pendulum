@@ -60,6 +60,7 @@ from async_control import (
     TransitionQueue,
 )
 from real_env import RealRotaryInvertedPendulumEnv
+from control_safety import confirm_operator_arm
 from run_config import check_config, find_run_config, save_run_config
 
 
@@ -133,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--baud", type=int, default=2_000_000)
     p.add_argument("--episodes", type=int, default=50,
                    help="number of real-device episodes to collect")
+    p.add_argument("--arm", action="store_true",
+                   help="opt in to physical control; each episode still requires typed confirmation")
     p.add_argument("--episode-length-s", type=float, default=6.0)
     p.add_argument("--reset-settle-s", type=float, default=15.0,
                    help="max seconds to wait for the pendulum to come to rest "
@@ -147,13 +150,12 @@ def main(argv: list[str] | None = None) -> int:
                         "this rate even at high --gradient-steps. 50 Hz is "
                         "the canonical operating point for this rig — see "
                         "website/src/content/docs/reference/control-rate.md.")
-    p.add_argument("--action-mode", choices=("accel", "velocity", "position_delta"),
+    p.add_argument("--action-mode", choices=("accel", "velocity"),
                    default="velocity",
                    help="how the action drives the motor. Must match the mode the "
                         "sim policy was trained with. 'accel' (default): "
                         "CMD_SET_ACCEL. 'velocity': velocity setpoint converted "
-                        "host-side to accel commands (same CMD_SET_ACCEL "
-                        "transport). 'position_delta': CMD_SET_TARGET.")
+                        "host-side to accel commands through protocol v1.")
     p.add_argument("--max-accel-rad-s2", type=float, default=150.0,
                    help="accel/velocity mode: accel command clamp [-max, +max] "
                         "rad/s². Must match the sim training value (150).")
@@ -264,6 +266,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ignore-config-mismatch", action="store_true",
                    help="downgrade the config.json validation abort to a warning")
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
+    if not args.arm:
+        p.error("real-device fine-tuning is disarmed by default; pass --arm to opt in")
 
     # Validate flags against the source checkpoint's recorded training
     # config — fine-tuning with mismatched action mode / rate / reward
@@ -463,6 +467,7 @@ def main(argv: list[str] | None = None) -> int:
     timing_writer.writerow([
         "episode", "n_steps", "cumulative_reward", "terminated", "truncated",
         "mean_dt_ms", "std_dt_ms", "max_overrun_ms", "n_violations",
+        "max_state_age_ms", "max_state_rtt_ms", "max_command_rtt_ms",
         "learner_train_calls", "learner_total_train_s",
     ])
     timing_f.flush()
@@ -473,6 +478,9 @@ def main(argv: list[str] | None = None) -> int:
             int(ep.terminated), int(ep.truncated),
             f"{ep.mean_dt_ms:.3f}", f"{ep.std_dt_ms:.3f}",
             f"{ep.tick_stats.max_overrun_ms:.3f}", ep.tick_stats.n_violations,
+            f"{ep.tick_stats.max_state_age_ms:.3f}",
+            f"{ep.tick_stats.max_state_rtt_ms:.3f}",
+            f"{ep.tick_stats.max_command_rtt_ms:.3f}",
             n_train, f"{train_s:.3f}",
         ])
         timing_f.flush()
@@ -497,12 +505,17 @@ def main(argv: list[str] | None = None) -> int:
                 break
             is_eval = args.eval_every > 0 and (ep_idx + 1) % args.eval_every == 0
             print(f"\n[ep {ep_idx + 1}/{args.episodes}] reset (settle "
-                  f"{args.reset_settle_s} s) → engage → run"
+                  f"{args.reset_settle_s} s) → explicit confirmation → arm → run"
                   + ("  [deterministic eval]" if is_eval else ""))
             try:
                 env.reset()
+                confirm_operator_arm(
+                    requested=True,
+                    phrase=f"ARM EPISODE {ep_idx + 1}",
+                )
+                env.arm()
             except Exception as e:
-                print(f"ERROR during env.reset(): {e}", file=sys.stderr)
+                print(f"ERROR during reset/arming: {e}", file=sys.stderr)
                 break
 
             loop = AsyncControlLoop(
@@ -594,6 +607,9 @@ def main(argv: list[str] | None = None) -> int:
             model.logger.record("time/std_tick_dt_ms", ep_stats.std_dt_ms)
             model.logger.record("time/max_overrun_ms", ep_stats.tick_stats.max_overrun_ms)
             model.logger.record("time/n_timing_violations", ep_stats.tick_stats.n_violations)
+            model.logger.record("time/max_state_age_ms", ep_stats.tick_stats.max_state_age_ms)
+            model.logger.record("time/max_state_rtt_ms", ep_stats.tick_stats.max_state_rtt_ms)
+            model.logger.record("time/max_command_rtt_ms", ep_stats.tick_stats.max_command_rtt_ms)
             model.logger.record("time/learner_train_calls", n_train)
             model.logger.record("time/learner_total_train_s", train_s)
             model.logger.dump(step=model.num_timesteps)

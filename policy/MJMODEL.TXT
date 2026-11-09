@@ -1,0 +1,558 @@
+MuJoCo version 3.11.0
+model name     rotary_inverted_pendulum
+
+MEMORY
+  total             6 KB
+  other             6 KB
+
+SIZES
+  nq                  2
+  nv                  2
+  nu                  1
+  nactuator           1
+  nout                1
+  nbody               3
+  njnt                2
+  ntree               1
+  nM                  3
+  nB                  6
+  nC                  3
+  nD                  4
+  ngeom               3
+  nlight              1
+  nnames              118
+  npaths              1
+  nnames_map          20
+  nJmom               1
+  njmax               -1
+  nconmax             -1
+  narena              13631488
+  nbuffer             12492
+
+FLAG
+  flg_gravcomp        0
+  flg_surfacevel      0
+
+OPTION
+  timestep            0.001   
+  impratio            1       
+  tolerance           1e-08   
+  ls_tolerance        0.01    
+  noslip_tolerance    1e-06   
+  ccd_tolerance       1e-06   
+  sleep_tolerance     0.001   
+  gravity             0        0       -9.8     
+  wind                0        0        0       
+  magnetic            0       -0.5      0       
+  density             0       
+  viscosity           0       
+  o_margin            0       
+  o_solref            0.02     1       
+  o_solimp            0.9      0.95     0.001    0.5      2       
+  o_friction          1        1        0.005    0.0001   0.0001  
+  integrator          3
+  cone                0
+  jacobian            2
+  solver              2
+  iterations          100
+  ls_iterations       50
+  noslip_iterations   0
+  ccd_iterations      35
+  disableflags        0
+  enableflags         0
+  disableactuator     0
+  sdf_initpoints      40
+  sdf_iterations      10
+
+VISUAL
+  GLOBAL
+    cameraid          -1
+    orthographic      0
+    fovy              45      
+    ipd               0.068   
+    azimuth           90      
+    elevation        -45      
+    linewidth         1       
+    glow              0.3     
+    realtime          1       
+    offwidth          640
+    offheight         480
+    ellipsoidinertia  0
+    bvactive          1
+  QUALITY
+    shadowsize        4096
+    offsamples        4
+    numslices         28
+    numstacks         16
+    numquads          4
+  HEADLIGHT
+    ambient           0.1      0.1      0.1     
+    diffuse           0.4      0.4      0.4     
+    specular          0.5      0.5      0.5     
+    active            1
+  MAP
+    stiffness         1e+02   
+    stiffnessrot      5e+02   
+    force             0.005   
+    torque            0.1     
+    alpha             0.3     
+    fogstart          3       
+    fogend            10      
+    znear             0.01    
+    zfar              50      
+    haze              0.3     
+    shadowclip        1       
+    shadowscale       0.6     
+    actuatortendon    2       
+  SCALE
+    forcewidth        0.1     
+    contactwidth      0.3     
+    contactheight     0.1     
+    connect           0.2     
+    com               0.4     
+    camera            0.3     
+    light             0.3     
+    selectpoint       0.2     
+    jointlength       1       
+    jointwidth        0.1     
+    actuatorlength    0.7     
+    actuatorwidth     0.2     
+    framelength       1       
+    framewidth        0.1     
+    constraint        0.1     
+    slidercrank       0.2     
+    frustum           10      
+  RGBA
+    fog               0        0        0        1       
+    haze              1        1        1        1       
+    force             1        0.5      0.5      1       
+    inertia           0.8      0.2      0.2      0.6     
+    joint             0.2      0.6      0.8      1       
+    actuator          0.2      0.25     0.2      1       
+    actuatornegative  0.2      0.6      0.9      1       
+    actuatorpositive  0.9      0.4      0.2      1       
+    com               0.9      0.9      0.9      1       
+    camera            0.6      0.9      0.6      1       
+    light             0.6      0.6      0.9      1       
+    selectpoint       0.9      0.9      0.1      1       
+    connect           0.2      0.2      0.8      1       
+    contactpoint      0.9      0.6      0.2      1       
+    contactforce      0.7      0.9      0.9      1       
+    contactfriction   0.9      0.8      0.4      1       
+    contacttorque     0.9      0.7      0.9      1       
+    contactgap        0.5      0.8      0.9      1       
+    rangefinder       1        1        0.1      1       
+    constraint        0.9      0        0        1       
+    slidercrank       0.5      0.3      0.8      1       
+    crankbroken       0.9      0        0        1       
+    frustum           1        1        0        0.2     
+    bv                0        1        0        0.5     
+    bvactive          1        0        0        0.5     
+
+totalmass             0.044   
+
+STATISTIC
+  meaninertia         7.6e-05 
+  meanmass            0.022   
+  meansize            0.048   
+  extent              0.14    
+  center              0.057    0       -0.036   
+
+qpos0                 0         0        
+
+qpos_spring           0         0        
+
+
+BODY 0:
+  name                  world
+  body_parentid         0 
+  body_rootid           0 
+  body_weldid           0 
+  body_mocapid          -1 
+  body_jntnum           0 
+  body_jntadr           -1 
+  body_dofnum           0 
+  body_dofadr           -1 
+  body_treeid           -1 
+  body_geomnum          0 
+  body_geomadr          -1 
+  body_simple           1 
+  body_sameframe        1 
+  body_pos              0         0         0        
+  body_quat             1         0         0         0        
+  body_ipos             0         0         0        
+  body_iquat            1         0         0         0        
+  body_mass             0        
+  body_subtreemass      0.044    
+  body_inertia          0         0         0        
+  body_invweight0       0         0        
+  body_gravcomp         0        
+  body_margin           0        
+  body_plugin           -1 
+  body_contype          0 
+  body_conaffinity      0 
+  body_bvhadr           -1 
+  body_bvhnum           0 
+
+BODY 1:
+  name                  arm
+  body_parentid         0 
+  body_rootid           1 
+  body_weldid           1 
+  body_mocapid          -1 
+  body_jntnum           1 
+  body_jntadr           0 
+  body_dofnum           1 
+  body_dofadr           0 
+  body_treeid           0 
+  body_geomnum          1 
+  body_geomadr          0 
+  body_simple           0 
+  body_sameframe        3 
+  body_pos              0         0         0        
+  body_quat             1         0         0         0        
+  body_ipos             0.035     0         0        
+  body_iquat            1         0         0         0        
+  body_mass             0.03     
+  body_subtreemass      0.044    
+  body_inertia          1e-06     1.1e-05   1.1e-05  
+  body_invweight0       7         5.7e+03  
+  body_gravcomp         0        
+  body_margin           0        
+  body_plugin           -1 
+  body_contype          0 
+  body_conaffinity      0 
+  body_bvhadr           -1 
+  body_bvhnum           0 
+
+BODY 2:
+  name                  pendulum
+  body_parentid         1 
+  body_rootid           1 
+  body_weldid           2 
+  body_mocapid          -1 
+  body_jntnum           1 
+  body_jntadr           1 
+  body_dofnum           1 
+  body_dofadr           1 
+  body_treeid           0 
+  body_geomnum          2 
+  body_geomadr          1 
+  body_simple           0 
+  body_sameframe        3 
+  body_pos              0.065     0         0        
+  body_quat             1         0         0         0        
+  body_ipos             0         0        -0.051    
+  body_iquat            1         0         0         0        
+  body_mass             0.014    
+  body_subtreemass      0.014    
+  body_inertia          8.1e-06   8.1e-06   1e-07    
+  body_invweight0       20        1.9e+04  
+  body_gravcomp         0        
+  body_margin           0        
+  body_plugin           -1 
+  body_contype          0 
+  body_conaffinity      0 
+  body_bvhadr           -1 
+  body_bvhnum           0 
+
+
+JOINT 0:
+  name                  motor_joint
+  jnt_type              3 
+  jnt_qposadr           0 
+  jnt_dofadr            0 
+  jnt_bodyid            1 
+  jnt_actuatorid        -1 
+  jnt_group             0 
+  jnt_limited           1 
+  jnt_actfrclimited     0 
+  jnt_actgravcomp       0 
+  jnt_solref            0.02      1        
+  jnt_solimp            0.9       0.95      0.001     0.5       2        
+  jnt_pos               0         0         0        
+  jnt_axis              0         0         1        
+  jnt_stiffness         0        
+  jnt_stiffnesspoly     0         0        
+  jnt_range            -0.041     0.041    
+  jnt_actfrcrange       0         0        
+  jnt_margin            0        
+
+JOINT 1:
+  name                  pendulum_joint
+  jnt_type              3 
+  jnt_qposadr           1 
+  jnt_dofadr            1 
+  jnt_bodyid            2 
+  jnt_actuatorid        -1 
+  jnt_group             0 
+  jnt_limited           0 
+  jnt_actfrclimited     0 
+  jnt_actgravcomp       0 
+  jnt_solref            0.02      1        
+  jnt_solimp            0.9       0.95      0.001     0.5       2        
+  jnt_pos               0         0         0        
+  jnt_axis              1         0         0        
+  jnt_stiffness         0        
+  jnt_stiffnesspoly     0         0        
+  jnt_range             0         0        
+  jnt_actfrcrange       0         0        
+  jnt_margin            0        
+
+
+DOF 0:
+  dof_bodyid            1 
+  dof_jntid             0 
+  dof_parentid          -1 
+  dof_treeid            0 
+  dof_Madr              0 
+  dof_simplenum         0 
+  dof_solref            0.02      1        
+  dof_solimp            0.9       0.95      0.001     0.5       2        
+  dof_frictionloss      0        
+  dof_armature          0        
+  dof_damping           0.0001   
+  dof_dampingpoly       0         0        
+  dof_invweight0        1.7e+04  
+  dof_M0                0.00011  
+  dof_length            0.039    
+
+DOF 1:
+  dof_bodyid            2 
+  dof_jntid             1 
+  dof_parentid          0 
+  dof_treeid            0 
+  dof_Madr              1 
+  dof_simplenum         0 
+  dof_solref            0.02      1        
+  dof_solimp            0.9       0.95      0.001     0.5       2        
+  dof_frictionloss      1.8e-05  
+  dof_armature          0        
+  dof_damping           9.9e-06  
+  dof_dampingpoly       0         0        
+  dof_invweight0        4.1e+04  
+  dof_M0                4.4e-05  
+  dof_length            0.057    
+
+
+TREE 0:
+  tree_bodyadr          1 
+  tree_bodynum          2 
+  tree_dofadr           0 
+  tree_dofnum           2 
+  tree_sleep_policy     1 
+
+
+GEOM 0:
+  name                  arm_visual
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      0 
+  geom_condim           3 
+  geom_bodyid           1 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        0 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.004     0.033     0        
+  geom_aabb             0         0         0         0.004     0.004     0.037    
+  geom_rbound           0.037    
+  geom_pos              0.033     0         0        
+  geom_quat             0.71      0        -0.71      0        
+  geom_friction         1         0.005     0.0001   
+  geom_margin           0        
+  geom_gap              0        
+  geom_surfacevel       0         0         0         0         0         0        
+  geom_adhesion         0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0.4       0.6       0.8       1        
+
+GEOM 1:
+  name                  pendulum_visual
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      0 
+  geom_condim           3 
+  geom_bodyid           2 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        3 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.003     0.051     0        
+  geom_aabb             0         0         0         0.003     0.003     0.054    
+  geom_rbound           0.054    
+  geom_pos              0         0        -0.051    
+  geom_quat             1         0         0         0        
+  geom_friction         1         0.005     0.0001   
+  geom_margin           0        
+  geom_gap              0        
+  geom_surfacevel       0         0         0         0         0         0        
+  geom_adhesion         0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0.8       0.4       0.4       1        
+
+GEOM 2:
+  name                  pendulum_tip
+  geom_type             2 
+  geom_contype          0 
+  geom_conaffinity      0 
+  geom_condim           3 
+  geom_bodyid           2 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        3 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.006     0         0        
+  geom_aabb             0         0         0         0.006     0.006     0.006    
+  geom_rbound           0.006    
+  geom_pos              0         0        -0.1      
+  geom_quat             1         0         0         0        
+  geom_friction         1         0.005     0.0001   
+  geom_margin           0        
+  geom_gap              0        
+  geom_surfacevel       0         0         0         0         0         0        
+  geom_adhesion         0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0.9       0.7       0.2       1        
+
+
+LIGHT 0:
+  name                  
+  light_mode            0 
+  light_bodyid          0 
+  light_targetbodyid    -1 
+  light_type            0 
+  light_texid           -1 
+  light_castshadow      1 
+  light_bulbradius      0.02     
+  light_intensity       0        
+  light_range           10       
+  light_active          1 
+  light_pos             0         0         1        
+  light_dir             0         0        -1        
+  light_poscom0        -0.045     0         1        
+  light_pos0            0         0         1        
+  light_dir0            0         0        -1        
+  light_attenuation     1         0         0        
+  light_cutoff          45       
+  light_exponent        10       
+  light_ambient         0         0         0        
+  light_diffuse         0.7       0.7       0.7      
+  light_specular        0.3       0.3       0.3      
+
+
+ACTUATOR 0:
+  name                  motor
+  actuator_trntype      0 
+  actuator_dyntype      0 
+  actuator_gaintype     0 
+  actuator_biastype     1 
+  actuator_ctrladr      0 
+  actuator_ctrlnum      1 
+  actuator_ctrlspec     0 
+  actuator_outadr       0 
+  actuator_outnum       1 
+  actuator_actadr       -1 
+  actuator_actnum       0 
+  actuator_trnid        0  -1 
+  actuator_cranklength  0        
+  actuator_dynprm       1         0         0         0         0         0         0         0         0         0        
+  actuator_gainprm      1e+03     0         0         0         0         0         0         0         0         0        
+  actuator_biasprm      0        -1e+03    -0.78      0         0         0         0         0         0         0        
+  actuator_actlimited   0 
+  actuator_actrange     0         0        
+  actuator_actearly     0 
+  actuator_history      0  0 
+  actuator_historyadr   -1 
+  actuator_delay        0        
+  actuator_damping      0        
+  actuator_dampingpoly  0         0        
+  actuator_armature     0        
+  actuator_group        0 
+  actuator_plugin       -1 
+  actuator_forcelimited 0 
+  actuator_forcerange   0         0        
+  actuator_ctrllimited  1 
+  actuator_ctrlrange   -2.2       2.2      
+  actuator_gear         1         0         0         0         0         0        
+  actuator_acc0         2.5e+04  
+  actuator_length0      0        
+  actuator_lengthrange  0         0        
+
+B: body-dof matrix
+----
+ xx |
+ xx |
+ xx |
+----
+
+B_ROWNNZ
+  2 2 2
+
+B_ROWADR
+  0 2 4
+
+B_COLIND
+  0 1 0 1 0 1
+
+M: reduced inertia matrix
+----
+ x  |
+ xx |
+----
+
+M_ROWNNZ
+  1 2
+
+M_ROWADR
+  0 1
+
+M_COLIND
+  0 0 1
+
+MAPM2M
+  0 2 1
+
+D: dof-dof matrix
+----
+ Dx |
+ xD |
+----
+
+D_ROWNNZ
+  2 2
+
+D_ROWADR
+  0 2
+
+D_COLIND
+  0 1 0 1
+
+MAPM2D
+  0 1 1 2
+
+MAPD2M
+  0 2 3
+
+
+SIGNATURE
+  10420466220512488050
+
+BVH:
+  id      depth   nodeid  child[0]  child[1]
+

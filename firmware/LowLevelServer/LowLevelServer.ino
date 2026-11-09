@@ -1,19 +1,12 @@
 #include <FastAccelStepper.h>
 #include <AS5600.h>
 #include <Wire.h>
+#include "ProtocolV1.h"
 
 // Communication speed
 const long BAUD_RATE = 2000000;
 
 // Command bytes
-#define CMD_READY 0x01
-#define CMD_GET_STATE 0x02
-#define CMD_SET_ACCEL 0x03   // was CMD_SET_TARGET (position-mode); now angular accel (rad/s²)
-#define CMD_ENGAGE_MOTOR 0x04
-#define CMD_DISENGAGE_MOTOR 0x05
-#define CMD_TARE_PENDULUM 0x06   // re-zero pen_position_rad to current AS5600 reading
-#define CMD_SET_TARGET 0x07      // position-mode: commanded motor position (rad) → moveTo
-#define CMD_ZERO_MOTOR 0x08      // re-zero the motor step counter to the arm's current position
 
 // Pin assignments. STEP must be on pin 9 (Timer1 OC1A on ATmega328) for
 // FastAccelStepper. DIR and ENABLE can be any digital pin.
@@ -69,8 +62,10 @@ const int32_t MOTOR_BRAKE_ACCEL_STEPS_S2 =
 // component of the rig's policy-loop lag. Tradeoff: ~√2× noisier
 // per-sample velocity estimate. See website/src/content/docs/reference/transport-delay.md.
 const uint16_t SAMPLE_PERIOD_US = 2000;
-const uint8_t  BUFFER_SIZE      = 16;
 const uint8_t  VEL_WINDOW       = 5;
+// Only the latest VEL_WINDOW samples are used. Keeping extra history wastes
+// 132 bytes of scarce Nano SRAM without affecting state or velocity results.
+const uint8_t  BUFFER_SIZE      = VEL_WINDOW;
 // Discard impossibly-large per-sample wraps as I²C glitches. Real
 // pendulum tops out at ~50 rad/s, so in one 2 ms sample period the
 // raw AS5600 reading can change by at most 50·0.002·4096/(2π) ≈ 65 LSB.
@@ -96,21 +91,68 @@ FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepper = NULL;
 AS5600 as5600;
 
-// `motor_engaged` is only touched from loop() / handleCommand() — no ISR
-// access — so `volatile` would only mislead future readers. Plain bool.
+// Motor state is owned by the safety hooks; no ISR accesses this flag.
 bool motor_engaged = false;
 
+// Safety and sensor-health flags shared with the framed protocol dispatcher.
+// Keep these assignments in sync with protocol/v1.md.
+static const uint16_t HEALTH_ENCODER_VALID  = 0x0001;
+static const uint16_t HEALTH_SAMPLER_FRESH  = 0x0002;
+static const uint16_t HEALTH_STEPPER_READY  = 0x0004;
+static const uint16_t HEALTH_ARMED          = 0x0008;
+static const uint16_t HEALTH_MAGNET_DETECTED = 0x0010;
+static const uint16_t REQUIRED_ARM_HEALTH = 0x0017;
+
+static const uint16_t FAULT_LEASE_EXPIRED = 0x0001;
+static const uint16_t FAULT_ENCODER_STALE = 0x0002;
+static const uint16_t FAULT_ENCODER_FROZEN = 0x0004;
+static const uint16_t FAULT_ENCODER_INVALID = 0x0008;
+static const uint16_t FAULT_HARD_LIMIT = 0x0010;
+static const uint16_t FAULT_INTERNAL = 0x0020;
+
+static const uint32_t ENCODER_STALE_US = 10000UL;
+static const uint32_t MAGNET_CHECK_MS = 100UL;
+static const uint32_t COMMAND_LEASE_MS = 100UL;
+static const int32_t FROZEN_ENCODER_MOTOR_TRAVEL_STEPS = 6400;
+static const uint32_t FROZEN_ENCODER_CONFIRM_MS = 1000UL;
+
+static uint16_t latched_fault_flags = 0;
+static bool encoder_sample_valid = false;
+static bool encoder_magnet_detected = false;
+static uint8_t consecutive_bad_encoder_samples = 0;
+static uint32_t last_valid_encoder_us = 0;
+static uint32_t last_magnet_check_ms = 0;
+static uint32_t last_valid_accel_ms = 0;
+static long frozen_reference_raw = -1;
+static int32_t frozen_reference_motor_steps = 0;
+static uint32_t frozen_reference_ms = 0;
+
 // Function prototypes
-void handleCommand();
-void sendState();
 void sampleState();
 void computeVelocities(float* motor_vel_rad_s, float* pen_vel_rad_s);
+bool safety_is_disarmed();
+bool safety_is_armed();
+uint16_t safety_health_flags();
+uint16_t safety_fault_flags();
+uint8_t safety_arm();
+void safety_disarm(uint8_t reason);
+uint8_t safety_set_acceleration(float accel_rad_s2);
+uint8_t safety_tare();
+uint8_t safety_zero();
+void safety_note_valid_accel(uint32_t now_ms);
+void safety_check_command_lease(uint32_t now_ms);
+bool safety_get_state(uint32_t* time_us, float* motor_pos, float* pend_pos,
+                      float* motor_vel, float* pend_vel,
+                      uint16_t* health_flags, uint16_t* fault_flags);
 
 void setup()
 {
     Serial.begin(BAUD_RATE);
     Wire.begin();
     Wire.setClock(400000);   // I²C fast mode for short transaction times.
+    // Bound Wire's synchronous waits so a stuck bus cannot stall the lease
+    // and sensor-fault checks indefinitely. Reset the TWI peripheral on expiry.
+    Wire.setWireTimeout(3000, true);
     as5600.begin();
 
     engine.init();
@@ -142,9 +184,10 @@ void setup()
     stepper->setForwardPlanningTimeInMs(8);
     stepper->disableOutputs();
 
-    while (!Serial) { ; }
-    while (!as5600.detectMagnet()) { delay(500); }
-
+    // Stay responsive and DISARMED even if USB is absent or the encoder
+    // magnet is missing. ARM is rejected until the sampled health checks pass.
+    encoder_magnet_detected = as5600.detectMagnet();
+    last_magnet_check_ms = millis();
     last_sample_us = micros();
 }
 
@@ -156,10 +199,8 @@ void loop()
         last_sample_us = now_us;
         sampleState();
     }
-    if (Serial.available() > 0)
-    {
-        handleCommand();
-    }
+    protocol_poll();
+    safety_check_command_lease(millis());
 }
 
 /*
@@ -170,6 +211,35 @@ void sampleState()
 {
     int32_t motor_step = stepper->getCurrentPosition();
     long raw = as5600.rawAngle();
+    // AS5600.rawAngle() returns uint16_t and masks to 12 bits even after an
+    // I2C error. Check lastError() or a disconnected sensor can look like a
+    // valid zero-angle sample and evade the stale/fault path.
+    if (as5600.lastError() != AS5600_OK) raw = -1;
+
+    uint32_t now_ms = millis();
+    if ((uint32_t)(now_ms - last_magnet_check_ms) >= MAGNET_CHECK_MS)
+    {
+        encoder_magnet_detected = as5600.detectMagnet();
+        last_magnet_check_ms = now_ms;
+    }
+    if (motor_engaged && !encoder_magnet_detected)
+        safety_disarm((uint8_t)FAULT_ENCODER_INVALID);
+
+    // AS5600 raw angle is a 12-bit value. An out-of-range return generally
+    // indicates a failed I2C transaction in the sensor library.
+    if (raw < 0 || raw >= 4096)
+    {
+        encoder_sample_valid = false;
+        if (consecutive_bad_encoder_samples < 255) consecutive_bad_encoder_samples++;
+        if (consecutive_bad_encoder_samples >= 3 && motor_engaged)
+            safety_disarm((uint8_t)FAULT_ENCODER_INVALID);
+        motor_step_buf[buf_head] = motor_step;
+        pen_rad_buf[buf_head] = pen_position_rad;
+        time_us_buf[buf_head] = last_sample_us;
+        buf_head = (buf_head + 1) % BUFFER_SIZE;
+        if (buf_head == 0) buf_filled = true;
+        return;
+    }
 
     // Pendulum wraparound tracking (AS5600 is 12-bit; wrap threshold ±2048).
     if (pen_raw_prev < 0)
@@ -188,6 +258,10 @@ void sampleState()
         // velocity for this tick will be slightly stale but stays sane.
         if (delta > PEN_RAW_MAX_DELTA_LSB || delta < -PEN_RAW_MAX_DELTA_LSB)
         {
+            encoder_sample_valid = false;
+            if (consecutive_bad_encoder_samples < 255) consecutive_bad_encoder_samples++;
+            if (consecutive_bad_encoder_samples >= 3 && motor_engaged)
+                safety_disarm((uint8_t)FAULT_ENCODER_INVALID);
             // Don't update pen_raw_prev either: next good read will
             // compute the delta against the last trustworthy reading.
         }
@@ -195,7 +269,27 @@ void sampleState()
         {
             pen_position_rad += (float)delta * ((2.0f * PI) / 4096.0f);
             pen_raw_prev = raw;
+            encoder_sample_valid = true;
+            consecutive_bad_encoder_samples = 0;
+            last_valid_encoder_us = last_sample_us;
         }
+    }
+
+    // A stationary pendulum can legitimately repeat the same encoder code.
+    // Only flag a frozen sensor after the motor has traversed two full turns
+    // with no encoder-code change, then remained unchanged for another second.
+    if (frozen_reference_raw < 0 || raw != frozen_reference_raw)
+    {
+        frozen_reference_raw = raw;
+        frozen_reference_motor_steps = motor_step;
+        frozen_reference_ms = now_ms;
+    }
+    else if (motor_engaged &&
+             labs((long)motor_step - (long)frozen_reference_motor_steps) >=
+                 FROZEN_ENCODER_MOTOR_TRAVEL_STEPS &&
+             (uint32_t)(now_ms - frozen_reference_ms) >= FROZEN_ENCODER_CONFIRM_MS)
+    {
+        safety_disarm((uint8_t)FAULT_ENCODER_FROZEN);
     }
 
     motor_step_buf[buf_head] = motor_step;
@@ -239,198 +333,167 @@ void computeVelocities(float* motor_vel_rad_s, float* pen_vel_rad_s)
     *pen_vel_rad_s = pen_delta / dt_s;
 }
 
-/*
- * Handle incoming commands.
- */
-void handleCommand()
+// Safety-owned protocol hooks. The parser calls these only after frame, CRC,
+// sequence and payload validation. No hook blocks waiting for serial input.
+bool safety_is_disarmed() { return !motor_engaged; }
+bool safety_is_armed() { return motor_engaged; }
+uint16_t safety_fault_flags() { return latched_fault_flags; }
+
+uint16_t safety_health_flags()
 {
-    uint8_t command = Serial.read();
+    uint16_t flags = 0;
+    uint32_t now_us = micros();
+    uint8_t samples = buf_filled ? BUFFER_SIZE : buf_head;
+    if (stepper != NULL) flags |= HEALTH_STEPPER_READY;
+    if (motor_engaged) flags |= HEALTH_ARMED;
+    if (encoder_magnet_detected &&
+        (uint32_t)(millis() - last_magnet_check_ms) <= 3UL * MAGNET_CHECK_MS)
+        flags |= HEALTH_MAGNET_DETECTED;
+    if (samples >= VEL_WINDOW && encoder_sample_valid &&
+        last_valid_encoder_us != 0 &&
+        (uint32_t)(now_us - last_valid_encoder_us) <= ENCODER_STALE_US)
+        flags |= HEALTH_ENCODER_VALID;
+    if (samples >= VEL_WINDOW && last_sample_us != 0 &&
+        (uint32_t)(now_us - last_sample_us) <= ENCODER_STALE_US)
+        flags |= HEALTH_SAMPLER_FRESH;
+    return flags;
+}
 
-    switch (command)
+void safety_disarm(uint8_t reason)
+{
+    if (reason != 0) latched_fault_flags |= (uint16_t)reason;
+    motor_engaged = false;
+    last_valid_accel_ms = 0;
+    if (stepper != NULL)
     {
-    case CMD_READY:
-        Serial.write(CMD_READY);
-        break;
-
-    case CMD_GET_STATE:
-        sendState();
-        break;
-
-    case CMD_SET_ACCEL:
-        {
-            // Read 4 bytes (size of float) with a short timeout. If a byte
-            // gets dropped — UART overrun under stepper EMI, or a flipped
-            // command byte that desyncs the parser — readBytes returns
-            // short and we bail. The next command re-syncs.
-            Serial.setTimeout(5);
-            float accel_rad_s2;
-            size_t n = Serial.readBytes((char *)&accel_rad_s2, sizeof(float));
-            Serial.setTimeout(1000);  // restore Stream default
-            if (n != sizeof(float)) break;
-
-            if (!motor_engaged) break;
-
-            // Convert rad/s² to steps/s² (STEPS_PER_REVOLUTION microsteps per revolution).
-            // moveByAcceleration takes int32_t.
-            int32_t accel_steps_s2 =
-                (int32_t)(accel_rad_s2 * ((float)STEPS_PER_REVOLUTION / (2.0f * PI)));
-
-            // Position-limit safety: past the rail, ignore the host's
-            // command and actively brake instead. Just zeroing accel here
-            // is dangerous — with allow_reverse=true, an accel of 0 means
-            // "hold current speed", so a motor at +5 rad/s heading
-            // outbound would coast indefinitely if the host went quiet.
-            // Brake with a fixed opposing accel so we decelerate
-            // regardless of host liveness.
-            int32_t cur_pos = stepper->getCurrentPosition();
-            if (cur_pos >= MOTOR_SAFE_LIMIT_STEPS)
-            {
-                accel_steps_s2 = -MOTOR_BRAKE_ACCEL_STEPS_S2;
-            }
-            else if (cur_pos <= -MOTOR_SAFE_LIMIT_STEPS)
-            {
-                accel_steps_s2 = +MOTOR_BRAKE_ACCEL_STEPS_S2;
-            }
-
-            // allow_reverse=true makes the library decelerate smoothly through
-            // zero when the sign of accel opposes the current velocity — no
-            // state machine needed on our side.
-            stepper->moveByAcceleration(accel_steps_s2, true);
-        }
-        break;
-
-    case CMD_SET_TARGET:
-        {
-            // Position-mode command: absolute motor target in radians. The host
-            // integrates the policy's per-tick deltas and sends the absolute
-            // target each tick; the stepper ramps toward it (moveTo). Coexists
-            // with CMD_SET_ACCEL. Sign matches CMD_SET_ACCEL: target arrives
-            // un-flipped (positions flip only on GET_STATE output).
-            Serial.setTimeout(5);
-            float target_rad;
-            size_t n = Serial.readBytes((char *)&target_rad, sizeof(float));
-            Serial.setTimeout(1000);  // restore Stream default
-            if (n != sizeof(float)) break;
-
-            if (!motor_engaged) break;
-
-            // Clamp to the safety rail so the policy can never command a
-            // target past the mechanical hard stop.
-            int32_t target_steps = (int32_t)lroundf(target_rad * STEPS_PER_RAD);
-            if (target_steps >  MOTOR_SAFE_LIMIT_STEPS) target_steps =  MOTOR_SAFE_LIMIT_STEPS;
-            if (target_steps < -MOTOR_SAFE_LIMIT_STEPS) target_steps = -MOTOR_SAFE_LIMIT_STEPS;
-
-            // Re-assert the ramp acceleration (CMD_ENGAGE_MOTOR left it at
-            // 1 step/s²; see the constant's note).
-            stepper->setAcceleration(MOTOR_ACCEL_STEPS_S2);
-            stepper->moveTo(target_steps);
-        }
-        break;
-
-    case CMD_ENGAGE_MOTOR:
-        motor_engaged = true;
-        stepper->enableOutputs();
-        // Start in zero-accel state. moveByAcceleration(0, true) means
-        // "hold current speed", and since we've just enabled the driver
-        // the stepper is at rest — so this leaves it at rest until the
-        // host sends its first CMD_SET_ACCEL.
-        // Note: ENGAGE does not re-zero `getCurrentPosition()` or
-        // `pen_position_rad`. Position counters persist across
-        // engage/disengage cycles (and across episodes) by design — the
-        // host is responsible for tracking the frame.
-        stepper->moveByAcceleration(0, true);
-        break;
-
-    case CMD_DISENGAGE_MOTOR:
-        motor_engaged = false;
-        // forceStop() drains the Timer1 step queue immediately; without this,
-        // queued steps would continue advancing the firmware position counter
-        // even though the driver's enable pin is HIGH.
         stepper->forceStop();
         stepper->disableOutputs();
-        break;
-
-    case CMD_TARE_PENDULUM:
-        // Re-zero pen_position_rad to the current AS5600 reading. Used by
-        // real_env.reset() after the pendulum has settled at rest so that
-        // each fine-tune episode samples a fresh bias from the rig's
-        // static-friction-bounded rest distribution (±1.9°). Without this,
-        // all fine-tune episodes share the firmware-boot bias and the
-        // policy overfits to that single calibration offset.
-        //
-        // Shift pen_position_rad AND every entry in pen_rad_buf by the
-        // current pen_position_rad. The buffer's relative deltas (used
-        // by computeVelocities) are preserved, so velocity calculation
-        // continues uninterrupted across the tare. Disable interrupts so
-        // sampleState() doesn't run mid-update with a partially-shifted
-        // buffer.
-        noInterrupts();
-        {
-            float offset = pen_position_rad;
-            for (uint8_t i = 0; i < BUFFER_SIZE; i++)
-            {
-                pen_rad_buf[i] -= offset;
-            }
-            pen_position_rad = 0.0f;
-        }
-        interrupts();
-        Serial.write(CMD_TARE_PENDULUM);  // ack
-        break;
-
-    case CMD_ZERO_MOTOR:
-        // Re-zero the step counter to the arm's current position, for when the
-        // operator has moved the arm by hand between episodes. Shift the ring
-        // buffer by the same offset (as CMD_TARE_PENDULUM does) so velocity
-        // stays continuous; interrupts off for a consistent buffer.
-        noInterrupts();
-        {
-            int32_t offset = stepper->getCurrentPosition();
-            for (uint8_t i = 0; i < BUFFER_SIZE; i++)
-            {
-                motor_step_buf[i] -= offset;
-            }
-            stepper->setCurrentPosition(0);
-        }
-        interrupts();
-        Serial.write(CMD_ZERO_MOTOR);  // ack
-        break;
-
-    default:
-        break;
     }
 }
 
-/*
- * Send the current state of the system:
- * - Current time in microseconds   (4 bytes, uint32)
- * - Stepper motor position in rad  (4 bytes, float)
- * - Pendulum position in rad       (4 bytes, float)
- * - Stepper motor velocity in rad/s (4 bytes, float)
- * - Pendulum velocity in rad/s     (4 bytes, float)
- */
-void sendState()
+uint8_t safety_arm()
 {
-    // Take the most recent buffer entry as the instantaneous position,
-    // and compute velocity from the (newest - oldest)/Δt regression
-    // window. The timestamp is the sample time of `newest` — not a
-    // fresh micros() — so the host gets a self-consistent (t, pos, vel)
-    // tuple it can time-align without inheriting up-to-one-sample of
-    // bias.
-    uint8_t newest = (uint8_t)((buf_head + BUFFER_SIZE - 1) % BUFFER_SIZE);
-    uint32_t current_time = time_us_buf[newest];
-    float motor_position_radians = (float)motor_step_buf[newest] * RAD_PER_STEP;
-    float pendulum_position_radians = pen_rad_buf[newest];
+    if (latched_fault_flags != 0) return ProtocolV1::STATUS_FAULT_LATCHED;
+    if (motor_engaged) return ProtocolV1::STATUS_OK;
+    if (stepper == NULL ||
+        (safety_health_flags() & REQUIRED_ARM_HEALTH) != REQUIRED_ARM_HEALTH)
+        return ProtocolV1::STATUS_INVALID_VALUE;
 
-    float motor_velocity_rad_s, pendulum_velocity_rad_s;
-    computeVelocities(&motor_velocity_rad_s, &pendulum_velocity_rad_s);
+    int32_t current_steps = stepper->getCurrentPosition();
+    int32_t hard_limit_steps = (int32_t)(132.0f * STEPS_PER_REVOLUTION / 360.0f);
+    if (labs((long)current_steps) >= hard_limit_steps)
+    {
+        latched_fault_flags |= FAULT_HARD_LIMIT;
+        return ProtocolV1::STATUS_FAULT_LATCHED;
+    }
 
-    // Values go out exactly as the firmware measures them (step counter,
-    // AS5600 accumulator) — one frame everywhere, no flips on either side.
-
-    // Pack and send the data
-    Serial.write((byte *)&current_time, sizeof(current_time));
-    Serial.write((byte *)&motor_position_radians, sizeof(motor_position_radians));
-    Serial.write((byte *)&pendulum_position_radians, sizeof(pendulum_position_radians));
-    Serial.write((byte *)&motor_velocity_rad_s, sizeof(motor_velocity_rad_s));
-    Serial.write((byte *)&pendulum_velocity_rad_s, sizeof(pendulum_velocity_rad_s));
+    motor_engaged = true;
+    last_valid_accel_ms = millis();
+    stepper->enableOutputs();
+    stepper->moveByAcceleration(0, true);
+    return ProtocolV1::STATUS_OK;
 }
+
+uint8_t safety_set_acceleration(float accel_rad_s2)
+{
+    if (!motor_engaged) return ProtocolV1::STATUS_NOT_ARMED;
+    if (!isfinite(accel_rad_s2) || fabsf(accel_rad_s2) > 150.0f)
+        return ProtocolV1::STATUS_INVALID_VALUE;
+
+    int32_t current_steps = stepper->getCurrentPosition();
+    int32_t hard_limit_steps = (int32_t)(132.0f * STEPS_PER_REVOLUTION / 360.0f);
+    if (labs((long)current_steps) >= hard_limit_steps)
+    {
+        safety_disarm((uint8_t)FAULT_HARD_LIMIT);
+        return ProtocolV1::STATUS_FAULT_LATCHED;
+    }
+
+    int32_t accel_steps_s2 = (int32_t)(accel_rad_s2 * STEPS_PER_RAD);
+    if (current_steps >= MOTOR_SAFE_LIMIT_STEPS)
+        accel_steps_s2 = -MOTOR_BRAKE_ACCEL_STEPS_S2;
+    else if (current_steps <= -MOTOR_SAFE_LIMIT_STEPS)
+        accel_steps_s2 = MOTOR_BRAKE_ACCEL_STEPS_S2;
+    stepper->moveByAcceleration(accel_steps_s2, true);
+    return ProtocolV1::STATUS_OK;
+}
+
+uint8_t safety_tare()
+{
+    if (motor_engaged) return ProtocolV1::STATUS_NOT_DISARMED;
+    if (!encoder_sample_valid || !encoder_magnet_detected)
+        return ProtocolV1::STATUS_INVALID_VALUE;
+    noInterrupts();
+    float offset = pen_position_rad;
+    for (uint8_t i = 0; i < BUFFER_SIZE; ++i) pen_rad_buf[i] -= offset;
+    pen_position_rad = 0.0f;
+    interrupts();
+    return ProtocolV1::STATUS_OK;
+}
+
+uint8_t safety_zero()
+{
+    if (motor_engaged) return ProtocolV1::STATUS_NOT_DISARMED;
+    if (stepper == NULL) return ProtocolV1::STATUS_INVALID_VALUE;
+    noInterrupts();
+    int32_t offset = stepper->getCurrentPosition();
+    for (uint8_t i = 0; i < BUFFER_SIZE; ++i) motor_step_buf[i] -= offset;
+    stepper->setCurrentPosition(0);
+    interrupts();
+    return ProtocolV1::STATUS_OK;
+}
+
+void safety_note_valid_accel(uint32_t now_ms)
+{
+    last_valid_accel_ms = now_ms;
+}
+
+void safety_check_command_lease(uint32_t now_ms)
+{
+    if (motor_engaged &&
+        (uint32_t)(now_ms - last_valid_accel_ms) >= COMMAND_LEASE_MS)
+        safety_disarm((uint8_t)FAULT_LEASE_EXPIRED);
+
+    if (motor_engaged && last_sample_us != 0 &&
+        (uint32_t)(micros() - last_sample_us) > ENCODER_STALE_US)
+        safety_disarm((uint8_t)FAULT_ENCODER_STALE);
+
+    if (motor_engaged && stepper != NULL)
+    {
+        int32_t current_steps = stepper->getCurrentPosition();
+        int32_t hard_limit_steps = (int32_t)(132.0f * STEPS_PER_REVOLUTION / 360.0f);
+        if (labs((long)current_steps) >= hard_limit_steps)
+        {
+            safety_disarm((uint8_t)FAULT_HARD_LIMIT);
+            return;
+        }
+
+        // Keep the ±125° rail brake active even if the host stops sending
+        // commands between packets. Use the sampled velocity to avoid braking
+        // motion that is already moving back into the allowed range.
+        float motor_vel = 0.0f, pen_vel = 0.0f;
+        computeVelocities(&motor_vel, &pen_vel);
+        if (current_steps >= MOTOR_SAFE_LIMIT_STEPS && motor_vel > 0.0f)
+            stepper->moveByAcceleration(-MOTOR_BRAKE_ACCEL_STEPS_S2, true);
+        else if (current_steps <= -MOTOR_SAFE_LIMIT_STEPS && motor_vel < 0.0f)
+            stepper->moveByAcceleration(MOTOR_BRAKE_ACCEL_STEPS_S2, true);
+    }
+}
+
+bool safety_get_state(uint32_t* time_us, float* motor_pos, float* pend_pos,
+                      float* motor_vel, float* pend_vel,
+                      uint16_t* health_flags, uint16_t* fault_flags)
+{
+    uint8_t samples = buf_filled ? BUFFER_SIZE : buf_head;
+    *health_flags = safety_health_flags();
+    *fault_flags = latched_fault_flags;
+    if (samples < VEL_WINDOW || stepper == NULL) return false;
+    uint8_t newest = (uint8_t)((buf_head + BUFFER_SIZE - 1) % BUFFER_SIZE);
+    *time_us = time_us_buf[newest];
+    *motor_pos = (float)motor_step_buf[newest] * RAD_PER_STEP;
+    *pend_pos = pen_rad_buf[newest];
+    computeVelocities(motor_vel, pend_vel);
+    return isfinite(*motor_pos) && isfinite(*pend_pos) &&
+           isfinite(*motor_vel) && isfinite(*pend_vel);
+}
+
+// Binary command parsing/dispatch and state serialization are in ProtocolV1.h.

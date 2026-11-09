@@ -45,6 +45,13 @@ import numpy as np
 from stable_baselines3 import SAC
 
 from lowlevel_client import LowLevelClient
+from control_safety import (
+    REQUIRED_STATE_HEALTH,
+    UnsafeState,
+    confirm_operator_arm,
+    require_ack,
+    validate_state,
+)
 from run_config import check_config, find_run_config
 
 
@@ -95,14 +102,11 @@ def main(argv: list[str] | None = None) -> int:
                         "the policy was trained at — see "
                         "website/src/content/docs/reference/control-rate.md. Default 50 Hz "
                         "matches this rig's canonical design rate.")
-    p.add_argument("--action-mode", choices=("accel", "velocity", "position_delta"),
+    p.add_argument("--action-mode", choices=("accel", "velocity"),
                    default="velocity",
                    help="how the action drives the motor. 'accel' (default): via "
                         "CMD_SET_ACCEL. 'velocity': velocity setpoint converted "
-                        "host-side to an accel command each tick (same "
-                        "CMD_SET_ACCEL transport). 'position_delta': per-tick "
-                        "motor-target delta via CMD_SET_TARGET. Must match the "
-                        "training mode.")
+                        "host-side to an accel command each tick. Must match training.")
     p.add_argument("--max-accel-rad-s2", type=float, default=150.0,
                    help="accel/velocity mode: accel command clamp [-max, +max] "
                         "rad/s². Must match training-time max_accel_rad_s2 (150).")
@@ -115,8 +119,12 @@ def main(argv: list[str] | None = None) -> int:
                         "action × this (rad). Must match training (default 0.10).")
     p.add_argument("--duration-s", type=float, default=30.0)
     p.add_argument("--device", default="cpu")
+    p.add_argument("--arm", action="store_true",
+                   help="explicitly request ARM; motor remains disarmed without this flag")
+    p.add_argument("--max-state-age-ms", type=float, default=80.0,
+                   help="maximum host-receipt age accepted for a policy input (default 80 ms)")
     p.add_argument("--dry-run", action="store_true",
-                   help="run the loop but never engage the motor (sanity-check the protocol)")
+                   help="observation-only run; never arm or send acceleration")
     p.add_argument("--log", default=None,
                    help="save the trajectory (state + action) to this .npz path "
                         "for refined sysid / sim-to-real analysis")
@@ -132,6 +140,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ignore-config-mismatch", action="store_true",
                    help="downgrade the config.json validation abort to a warning")
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
+    if args.arm and args.dry_run:
+        p.error("--arm and --dry-run are incompatible")
+    if args.max_state_age_ms <= 0:
+        p.error("--max-state-age-ms must be positive")
+    if args.action_mode not in ("accel", "velocity"):
+        p.error("protocol v1 supports acceleration commands, not position targets")
 
     saved_cfg = find_run_config(args.policy) or {}
     obs_history_len = (
@@ -163,9 +177,13 @@ def main(argv: list[str] | None = None) -> int:
         expected["max_accel_rad_s2"] = float(args.max_accel_rad_s2)
         if args.action_mode == "velocity":
             expected["max_velocity_rad_s"] = float(args.max_velocity_rad_s)
-    else:
-        expected["max_action_delta_rad"] = float(args.max_action_delta_rad)
+
     check_config(args.policy, expected, ignore=args.ignore_config_mismatch)
+
+    arm_requested = confirm_operator_arm(
+        requested=args.arm,
+        phrase="ARM",
+    )
 
     print(f"Loading policy from {args.policy}")
     if str(args.policy).endswith(".pt"):
@@ -235,25 +253,22 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print("Arduino ready.")
 
-        # Seed the position-mode target integrator at the current motor
-        # position (also used by the dry-run loop's logging).
-        motor_target = 0.0
-        if args.action_mode == "position_delta":
-            motor_target = client.get_state().motor_pos_rad
-
-        if not args.dry_run:
-            client.engage_motor()
-            # Prime the firmware's command state AFTER engage — commands sent
-            # while disengaged are dropped (motor_engaged gate). Zero accel /
-            # current-position target both mean "hold still" until the first
-            # policy action lands.
-            if args.action_mode == "position_delta":
-                client.set_target(motor_target)
-            else:
-                client.set_acceleration(0.0)
-            print("Motor engaged.")
+        if arm_requested:
+            state = client.get_state()
+            validate_state(
+                state,
+                max_age_s=args.max_state_age_ms / 1000.0,
+                required_health_mask=REQUIRED_STATE_HEALTH,
+            )
+            require_ack(client.arm(), operation="ARM")
+            try:
+                require_ack(client.set_acceleration(0.0), operation="initial SET_ACCEL")
+            except Exception:
+                client.disarm()
+                raise
+            print("Motor armed after explicit --arm and typed confirmation.")
         else:
-            print("DRY RUN: motor stays disengaged.")
+            print("Motor remains DISARMED (observation-only).")
 
         prev_action = 0.0
 
@@ -266,6 +281,8 @@ def main(argv: list[str] | None = None) -> int:
         next_tick = time.monotonic()
         max_steps = int(args.duration_s * args.control_freq)
         ep_reward_proxy = 0.0
+        deadline_misses = 0
+        max_cycle_ms = 0.0
 
         # Honest balance counters (mirrors analyze_deploy.honest_balance_metrics).
         # "Balanced" requires near-upright AND slow — the legacy cos-proxy above
@@ -297,13 +314,18 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             while loop_count < max_steps and not interrupted:
-                # Pace to the requested control rate.
-                next_tick += dt
-                sleep_for = next_tick - time.monotonic()
+                tick_start = time.monotonic()
+                sleep_for = next_tick - tick_start
                 if sleep_for > 0:
                     time.sleep(sleep_for)
+                tick_start = time.monotonic()
 
                 s = client.get_state()
+                validate_state(
+                    s,
+                    max_age_s=args.max_state_age_ms / 1000.0,
+                    required_health_mask=REQUIRED_STATE_HEALTH,
+                )
 
                 # Firmware frame end-to-end; values feed the observation
                 # as-is.
@@ -321,7 +343,10 @@ def main(argv: list[str] | None = None) -> int:
                 obs = (frame if obs_history_len == 1
                        else np.concatenate(obs_history))
                 action, _ = model.predict(obs, deterministic=not args.stochastic)
-                a = float(np.clip(action.flatten()[0], -1.0, 1.0))
+                action_values = np.asarray(action, dtype=np.float32).reshape(-1)
+                if action_values.size != 1 or not np.isfinite(action_values[0]):
+                    raise UnsafeState("policy returned a non-finite or non-scalar action")
+                a = float(np.clip(action_values[0], -1.0, 1.0))
                 # Actuator sees the boxcar average; obs/logs keep the raw action.
                 if action_smooth_window > 1:
                     a_smooth_buf.append(a)
@@ -362,27 +387,24 @@ def main(argv: list[str] | None = None) -> int:
                             -args.max_velocity_rad_s, args.max_velocity_rad_s,
                         ))
                         v_cmd += 0.1 * (motor_vel - v_cmd)
-                else:
-                    # Position-delta mode: integrate the per-tick target delta,
-                    # clamp to the safety rail (the firmware clamps again), send
-                    # via moveTo. cmd_value is the commanded target (rad).
-                    motor_target = float(np.clip(
-                        motor_target + a_cmd * args.max_action_delta_rad,
-                        -MOTOR_SAFE_LIMIT_RAD, MOTOR_SAFE_LIMIT_RAD,
-                    ))
-                    cmd_value = motor_target
+                if args.arm and not args.dry_run:
+                    validate_state(
+                        s,
+                        max_age_s=args.max_state_age_ms / 1000.0,
+                        required_health_mask=REQUIRED_STATE_HEALTH,
+                    )
+                    require_ack(client.set_acceleration(cmd_value), operation="SET_ACCEL")
 
-                if not args.dry_run:
-                    try:
-                        if args.action_mode == "position_delta":
-                            client.set_target(cmd_value)
-                        else:
-                            client.set_acceleration(cmd_value)
-                    except OSError:
-                        # Serial syscall interrupted, almost always by SIGTERM
-                        # /SIGINT. Treat as interruption and exit cleanly.
-                        interrupted = True
-                        break
+                cycle_s = time.monotonic() - tick_start
+                max_cycle_ms = max(max_cycle_ms, cycle_s * 1000.0)
+                if cycle_s > dt:
+                    deadline_misses += 1
+                    raise UnsafeState(
+                        f"control deadline missed: {cycle_s * 1000:.2f} ms > {dt * 1000:.2f} ms"
+                    )
+                next_tick += dt
+                if next_tick < time.monotonic():
+                    next_tick = time.monotonic() + dt
 
                 # Reward for live monitoring
                 theta = _wrap_pi(s.pendulum_pos_rad - math.pi)
@@ -414,8 +436,7 @@ def main(argv: list[str] | None = None) -> int:
                     log_action[loop_count] = a
 
                 if loop_count % args.control_freq == 0:
-                    cmd_label = ("target" if args.action_mode == "position_delta"
-                                 else "accel_cmd")
+                    cmd_label = "accel_cmd"
                     print(
                         f"t={loop_count * dt:.1f}s  motor={motor_pos:+.3f} "
                         f"{cmd_label}={cmd_value:+6.2f}  theta={theta:+.3f}  "
@@ -425,22 +446,16 @@ def main(argv: list[str] | None = None) -> int:
                 prev_action = a
                 loop_count += 1
         finally:
-            # Belt-and-braces: stop further motion before disengaging coils.
-            # If we got here via SIGTERM/SIGINT we want a deterministic stop
-            # rather than relying solely on LowLevelClient.__exit__. In
-            # accel-mode "stop" means command zero acceleration; the firmware's
-            # safety logic will decelerate the stepper before we cut power. In
-            # position mode the last moveTo target already holds the motor, so
-            # we just disengage.
+            # Disarm is the fail-closed host cleanup. The firmware command
+            # lease independently stops/disables the driver if this ACK fails.
             try:
-                if args.action_mode != "position_delta":
-                    client.set_acceleration(0.0)
-                client.disengage_motor()
+                client.disarm()
             except Exception:
                 pass
             print(f"Loop finished. Steps: {loop_count}, "
+                  f"max cycle: {max_cycle_ms:.2f} ms, deadline misses: {deadline_misses}, "
                   f"avg upright proxy: {ep_reward_proxy / max(1, loop_count):.3f}, "
-                  f"motor disengaged.")
+                  f"motor disarmed.")
             if loop_count > 0:
                 print(f"Honest balance (|θ|≤15° AND |θ̇|≤{BAL_PEN_VEL_RAD_S:.0f} rad/s): "
                       f"fraction {bal_steps / loop_count:.3f}, "

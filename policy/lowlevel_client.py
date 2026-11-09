@@ -1,32 +1,11 @@
-"""Python client for the LowLevelServer Arduino sketch.
+"""Versioned, framed Python client for the Arduino LowLevelServer.
 
-Speaks the binary protocol defined at the top of
-firmware/LowLevelServer/LowLevelServer.ino:
-    0x01 READY               -> board echoes 0x01
-    0x02 GET_STATE           -> board returns 20 bytes:
-                                  uint32 time_us
-                                  float32 motor_pos_rad
-                                  float32 pendulum_pos_rad
-                                  float32 motor_vel_rad_s
-                                  float32 pendulum_vel_rad_s
-    0x03 SET_ACCEL + float   commanded angular acceleration in rad/s²
-    0x04 ENGAGE_MOTOR
-    0x05 DISENGAGE_MOTOR
-    0x07 SET_TARGET + float  commanded motor position in radians (position mode)
-
-Sign convention: LowLevelServer flips the sign of motor and pendulum
-positions AND velocities on output. We pass the raw bytes through;
-callers decide whether to apply additional transforms. The deploy code
-(`run_policy.py`) and the real-env (`real_env.py`) consume them as-is —
-the observation matches the sim convention.
-
-This client is request-driven (one 20-byte read per get_state call).
-Sustained bandwidth is tiny (~2 kB/s at 100 Hz), so 2 Mbaud is
-comfortably over-provisioned.
+Wire details are specified in protocol/v1.md. All transactions are serialized;
+no motion command is retransmitted after a timeout.
 """
-
 from __future__ import annotations
 
+import math
 import struct
 import threading
 import time
@@ -35,67 +14,185 @@ from dataclasses import dataclass
 import serial
 
 
-CMD_READY = 0x01
+PROTOCOL_VERSION = 1
+CMD_HELLO = 0x01
 CMD_GET_STATE = 0x02
-CMD_SET_ACCEL = 0x03  # was CMD_SET_TARGET (position-mode); now angular acceleration in rad/s²
-CMD_ENGAGE_MOTOR = 0x04
-CMD_DISENGAGE_MOTOR = 0x05
-CMD_TARE_PENDULUM = 0x06
-CMD_SET_TARGET = 0x07  # position-mode: commanded motor position in radians (moveTo)
-CMD_ZERO_MOTOR = 0x08  # re-zero the motor step counter to the arm's current position
+CMD_SET_ACCEL = 0x03
+CMD_ARM = 0x04
+CMD_DISARM = 0x05
+CMD_TARE = 0x06
+CMD_ZERO = 0x08
+RESP_ACK = 0x80
+RESP_HELLO_ACK = 0x81
+RESP_STATE = 0x82
 
-# time_us (uint32 LE), motor_pos, pen_pos, motor_vel, pen_vel (4× float32 LE).
-_STATE_STRUCT = struct.Struct("<Iffff")
-_STATE_SIZE = _STATE_STRUCT.size  # 20 bytes
+STATUS_OK = 0
+STATUS_BAD_VERSION = 1
+STATUS_BAD_LENGTH = 2
+STATUS_BAD_CRC = 3
+STATUS_BAD_SEQUENCE = 4
+STATUS_NOT_DISARMED = 5
+STATUS_INVALID_VALUE = 6
+STATUS_FAULT_LATCHED = 7
+STATUS_NOT_ARMED = 8
+STATUS_UNKNOWN_COMMAND = 9
+STATUS_STATE_UNAVAILABLE = 10
+
+MAX_PAYLOAD = 24
+MAX_ACCEL_RAD_S2 = 150.0  # protocol v1 command envelope; matches firmware and deployed config
+_HEADER = struct.Struct("<BBHB")
+_STATE = struct.Struct("<IffffHH")
+_ACK = struct.Struct("<BBH")
+_HELLO_ACK = struct.Struct("<BBHH")
+MAX_DECODED = _HEADER.size + MAX_PAYLOAD + 2
+MAX_ENCODED = MAX_DECODED + 1  # COBS overhead, excluding delimiter
+
+
+class ProtocolError(RuntimeError):
+    """Malformed, mismatched or stale serial-protocol data."""
+
+
+class TransactionTimeout(TimeoutError):
+    """No matching response arrived before the bounded transaction deadline."""
+
+
+@dataclass(frozen=True)
+class Ack:
+    request_type: int
+    status: int
+    fault_flags: int
+    sequence: int
+    rtt_ns: int
+
+    @property
+    def ok(self) -> bool:
+        return self.status == STATUS_OK
+
+
+class CommandRejected(ProtocolError):
+    def __init__(self, ack: Ack):
+        self.ack = ack
+        super().__init__(
+            f"command 0x{ack.request_type:02x} rejected: status={ack.status}, "
+            f"fault_flags=0x{ack.fault_flags:04x}"
+        )
 
 
 @dataclass(frozen=True)
 class State:
-    time_us: int           # Arduino's micros() when the read was taken
-    motor_pos_rad: float   # signed motor angle, firmware frame (step counter)
+    time_us: int
+    motor_pos_rad: float
     pendulum_pos_rad: float
     motor_vel_rad_s: float
     pendulum_vel_rad_s: float
+    health_flags: int
+    fault_flags: int
+    rx_monotonic_ns: int
+    rtt_ns: int
+
+
+def crc16_ccitt(data: bytes) -> int:
+    """CRC-16/CCITT-FALSE: poly=0x1021, init=0xffff, xorout=0."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def cobs_encode(data: bytes) -> bytes:
+    """Encode one non-empty record; caller appends the 0 delimiter."""
+    out = bytearray([0])
+    code_index = 0
+    code = 1
+    for byte in data:
+        if byte == 0:
+            out[code_index] = code
+            code_index = len(out)
+            out.append(0)
+            code = 1
+        else:
+            out.append(byte)
+            code += 1
+            if code == 0xFF:
+                out[code_index] = code
+                code_index = len(out)
+                out.append(0)
+                code = 1
+    out[code_index] = code
+    return bytes(out)
+
+
+def cobs_decode(data: bytes) -> bytes:
+    if not data:
+        raise ProtocolError("empty COBS record")
+    out = bytearray()
+    i = 0
+    while i < len(data):
+        code = data[i]
+        if code == 0:
+            raise ProtocolError("zero byte inside COBS record")
+        i += 1
+        end = i + code - 1
+        if end > len(data):
+            raise ProtocolError("truncated COBS block")
+        out.extend(data[i:end])
+        i = end
+        if code != 0xFF and i < len(data):
+            out.append(0)
+    return bytes(out)
+
+
+def encode_frame(frame_type: int, sequence: int, payload: bytes = b"") -> bytes:
+    if len(payload) > MAX_PAYLOAD:
+        raise ValueError(f"payload too large: {len(payload)} > {MAX_PAYLOAD}")
+    body = _HEADER.pack(PROTOCOL_VERSION, frame_type, sequence & 0xFFFF, len(payload)) + payload
+    decoded = body + struct.pack("<H", crc16_ccitt(body))
+    return cobs_encode(decoded) + b"\x00"
+
+
+def decode_frame(encoded: bytes) -> tuple[int, int, bytes]:
+    decoded = cobs_decode(encoded)
+    if len(decoded) < _HEADER.size + 2 or len(decoded) > MAX_DECODED:
+        raise ProtocolError("invalid decoded frame length")
+    version, frame_type, sequence, payload_len = _HEADER.unpack_from(decoded)
+    if version != PROTOCOL_VERSION:
+        raise ProtocolError(f"unsupported protocol version {version}")
+    if payload_len > MAX_PAYLOAD or len(decoded) != _HEADER.size + payload_len + 2:
+        raise ProtocolError("payload length does not match frame")
+    expected_crc = struct.unpack_from("<H", decoded, len(decoded) - 2)[0]
+    if crc16_ccitt(decoded[:-2]) != expected_crc:
+        raise ProtocolError("CRC mismatch")
+    return frame_type, sequence, decoded[_HEADER.size:-2]
 
 
 class LowLevelClient:
-    """Drives the LowLevelServer sketch over a serial port.
+    """Serialized request/response client; ARM is always explicit."""
 
-    Use as a context manager:
-
-        with LowLevelClient(port) as c:
-            c.wait_until_ready()
-            c.engage_motor()
-            c.set_acceleration(50.0)   # rad/s² — see RL_PLAN's accel-mode entry
-            s = c.get_state()
-            ...
-            c.disengage_motor()  # also called automatically by __exit__
-    """
-
-    def __init__(self, port: str, baud: int = 2_000_000, timeout: float = 0.5):
+    def __init__(self, port: str, baud: int = 2_000_000, timeout: float = 0.020):
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
         self.port = port
         self.baud = baud
         self.timeout = timeout
         self._ser: serial.Serial | None = None
-        # Serial transactions are guarded by a lock so the client is safe to
-        # use from multiple threads (e.g. an async control loop where one
-        # thread does periodic get_state/set_acceleration while the main
-        # thread may issue an emergency disengage_motor on signal).
         self._lock = threading.Lock()
+        self._seq = 0
+        self._last_state_time_us: int | None = None
 
     def __enter__(self) -> "LowLevelClient":
-        self._ser = serial.Serial(self.port, self.baud, timeout=self.timeout)
-        # Bootloader reset on serial open + setup() (which blocks on the AS5600
-        # magnet) typically takes ~2 s.
+        self._ser = serial.Serial(self.port, self.baud, timeout=self.timeout, write_timeout=self.timeout)
+        # Opening the USB serial port resets many Nano bootloaders.
         time.sleep(2.0)
         self._ser.reset_input_buffer()
+        self._ser.reset_output_buffer()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if self._ser is not None:
             try:
-                # Best-effort safe-state on exit: stop the motor.
-                self.disengage_motor()
+                self.disarm()
             except Exception:
                 pass
             self._ser.close()
@@ -107,113 +204,140 @@ class LowLevelClient:
             raise RuntimeError("LowLevelClient must be used as a context manager")
         return self._ser
 
-    # --- Handshake -------------------------------------------------------
+    def _next_sequence(self) -> int:
+        self._seq = (self._seq + 1) & 0xFFFF
+        return self._seq
 
-    def wait_until_ready(self, *, retries: int = 5, retry_delay_s: float = 0.5) -> bool:
-        """Send READY until the board echoes it back. Returns True on success."""
-        for _ in range(retries):
-            with self._lock:
-                self.ser.reset_input_buffer()
-                self.ser.write(bytes([CMD_READY]))
-                self.ser.flush()
-                resp = self.ser.read(1)
-            if resp == bytes([CMD_READY]):
+    def _read_packet(self, deadline: float) -> tuple[int, int, bytes]:
+        encoded = bytearray()
+        while time.monotonic() < deadline:
+            self.ser.timeout = max(0.0, min(0.005, deadline - time.monotonic()))
+            byte = self.ser.read(1)
+            if not byte:
+                continue
+            if byte == b"\x00":
+                if not encoded:
+                    continue
+                record = bytes(encoded)
+                return decode_frame(record)
+            encoded.extend(byte)
+            if len(encoded) > MAX_ENCODED:
+                # Drain to the next delimiter, within this transaction's deadline.
+                while time.monotonic() < deadline:
+                    self.ser.timeout = max(0.0, min(0.005, deadline - time.monotonic()))
+                    if self.ser.read(1) == b"\x00":
+                        break
+                raise ProtocolError("encoded frame exceeds fixed maximum")
+        raise TransactionTimeout("serial response deadline expired")
+
+    def _transact(self, frame_type: int, payload: bytes, response_type: int,
+                  *, timeout: float | None = None) -> tuple[int, bytes, int]:
+        with self._lock:
+            seq = self._next_sequence()
+            request = encode_frame(frame_type, seq, payload)
+            started = time.monotonic_ns()
+            self.ser.write(request)
+            self.ser.flush()
+            deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+            while True:
+                got_type, got_seq, got_payload = self._read_packet(deadline)
+                if got_seq != seq:
+                    # A delayed response is stale; never let it satisfy this transaction.
+                    continue
+                if got_type != response_type:
+                    raise ProtocolError(
+                        f"sequence {seq}: expected response 0x{response_type:02x}, "
+                        f"got 0x{got_type:02x}"
+                    )
+                ended = time.monotonic_ns()
+                return seq, got_payload, ended - started
+
+    @staticmethod
+    def _parse_ack(sequence: int, payload: bytes, request_type: int,
+                   rtt_ns: int) -> Ack:
+        if len(payload) != _ACK.size:
+            raise ProtocolError(f"ACK payload length {len(payload)} != {_ACK.size}")
+        ack_type, status, faults = _ACK.unpack(payload)
+        if ack_type != request_type:
+            raise ProtocolError("ACK request type does not match request")
+        ack = Ack(ack_type, status, faults, sequence, rtt_ns)
+        if not ack.ok:
+            raise CommandRejected(ack)
+        return ack
+
+    def wait_until_ready(self, *, retries: int = 5, retry_delay_s: float = 0.1) -> bool:
+        """Perform HELLO; safe to retry because it never arms the motor."""
+        for attempt in range(retries):
+            try:
+                seq, payload, _ = self._transact(CMD_HELLO, b"", RESP_HELLO_ACK)
+                if len(payload) != _HELLO_ACK.size:
+                    raise ProtocolError("invalid HELLO_ACK length")
+                version, max_payload, _health, _faults = _HELLO_ACK.unpack(payload)
+                if version != PROTOCOL_VERSION or max_payload != MAX_PAYLOAD:
+                    raise ProtocolError("board protocol capabilities do not match client")
                 return True
-            time.sleep(retry_delay_s)
+            except TransactionTimeout:
+                if attempt + 1 == retries:
+                    return False
+                time.sleep(retry_delay_s)
         return False
 
-    # --- Commands --------------------------------------------------------
+    def get_state(self, *, retries: int = 0) -> State:
+        """Read state; optional retries issue a new GET_STATE sequence."""
+        for attempt in range(retries + 1):
+            try:
+                seq, payload, rtt_ns = self._transact(CMD_GET_STATE, b"", RESP_STATE)
+                if len(payload) != _STATE.size:
+                    raise ProtocolError(f"STATE payload length {len(payload)} != {_STATE.size}")
+                time_us, motor_pos, pend_pos, motor_vel, pend_vel, health, faults = _STATE.unpack(payload)
+                values = (motor_pos, pend_pos, motor_vel, pend_vel)
+                if not all(math.isfinite(value) for value in values):
+                    raise ProtocolError("STATE contains non-finite sensor value")
+                if self._last_state_time_us is not None:
+                    delta = (time_us - self._last_state_time_us) & 0xFFFFFFFF
+                    if delta == 0 or delta >= 0x80000000:
+                        raise ProtocolError("STATE timestamp did not advance")
+                self._last_state_time_us = time_us
+                return State(int(time_us), *map(float, values), int(health), int(faults),
+                             time.monotonic_ns(), rtt_ns)
+            except TransactionTimeout:
+                if attempt == retries:
+                    raise
+        raise AssertionError("unreachable")
 
-    def get_state(self) -> State:
-        """Request a state reading. Blocks until 12 bytes arrive or timeout."""
-        with self._lock:
-            self.ser.write(bytes([CMD_GET_STATE]))
-            self.ser.flush()
-            buf = self.ser.read(_STATE_SIZE)
-        if len(buf) != _STATE_SIZE:
-            raise RuntimeError(
-                f"get_state: expected {_STATE_SIZE} bytes, got {len(buf)}. "
-                "Is the LowLevelServer sketch flashed? Does the magnet detect?"
+    def _command(self, command: int, *, timeout: float | None = None) -> Ack:
+        seq, payload, rtt_ns = self._transact(command, b"", RESP_ACK, timeout=timeout)
+        return self._parse_ack(seq, payload, command, rtt_ns)
+
+    def set_acceleration(self, accel_rad_s2: float) -> Ack:
+        value = float(accel_rad_s2)
+        if not math.isfinite(value):
+            raise ValueError("acceleration must be finite")
+        if abs(value) > MAX_ACCEL_RAD_S2:
+            raise ValueError(
+                f"acceleration exceeds protocol limit ±{MAX_ACCEL_RAD_S2:g} rad/s²"
             )
-        time_us, motor_rad, pen_rad, motor_vel, pen_vel = _STATE_STRUCT.unpack(buf)
-        return State(time_us=int(time_us), motor_pos_rad=float(motor_rad),
-                     pendulum_pos_rad=float(pen_rad),
-                     motor_vel_rad_s=float(motor_vel),
-                     pendulum_vel_rad_s=float(pen_vel))
+        payload = struct.pack("<f", value)
+        seq, response, rtt_ns = self._transact(CMD_SET_ACCEL, payload, RESP_ACK)
+        return self._parse_ack(seq, response, CMD_SET_ACCEL, rtt_ns)
 
-    def set_acceleration(self, accel_rad_s2: float) -> None:
-        """Command a new motor angular acceleration, in rad/s².
+    def arm(self) -> Ack:
+        return self._command(CMD_ARM)
 
-        Maps to FastAccelStepper's moveByAcceleration() with the matching
-        int32 steps/s² on the firmware side. The stepper will accelerate
-        smoothly toward the appropriate velocity rail (set once at boot via
-        setSpeedInUs), passing through zero on direction reversal without
-        any extra handling. Replaced the previous position-target command
-        as of the accel-mode switch — see RL_PLAN.md.
+    def disarm(self) -> Ack:
+        return self._command(CMD_DISARM)
 
-        No `flush()` after `write()`: the 5-byte payload sits in the OS
-        USB buffer until transmitted, but at our rate (50-100 Hz × 5 B =
-        250-500 B/s versus a 2 Mbaud link) the buffer never approaches
-        backing up, and the bytes are guaranteed on the wire before the
-        next tick's `get_state` round-trip starts. Removes ~1 ms of
-        macOS tcdrain overhead per tick. The other commands
-        (engage/disengage/READY handshake) keep the flush because they
-        run once per session, not per tick, and benefit from the
-        deterministic completion-by-return semantics.
-        """
-        payload = bytes([CMD_SET_ACCEL]) + struct.pack("<f", float(accel_rad_s2))
-        with self._lock:
-            self.ser.write(payload)
+    # Backward-compatible names, still requiring explicit caller action.
+    def engage_motor(self) -> Ack:
+        return self.arm()
 
-    def set_target(self, target_rad: float) -> None:
-        """Command a new motor position target, in radians (position mode).
-
-        Maps to the firmware's moveTo(). Sign convention: the
-        firmware frame, same as get_state and set_acceleration — one frame
-        everywhere.
-        No flush — a 5-byte payload per tick never backs up the 2 Mbaud link.
-        """
-        payload = bytes([CMD_SET_TARGET]) + struct.pack("<f", float(target_rad))
-        with self._lock:
-            self.ser.write(payload)
-
-    def engage_motor(self) -> None:
-        with self._lock:
-            self.ser.write(bytes([CMD_ENGAGE_MOTOR]))
-            self.ser.flush()
-
-    def disengage_motor(self) -> None:
-        with self._lock:
-            self.ser.write(bytes([CMD_DISENGAGE_MOTOR]))
-            self.ser.flush()
+    def disengage_motor(self) -> Ack:
+        return self.disarm()
 
     def tare_pendulum(self, *, timeout_s: float = 0.5) -> bool:
-        """Re-zero pen_position_rad to the AS5600's current reading.
-
-        Used by `real_env.reset()` so each fine-tune episode samples a
-        fresh bias from the rig's actual stiction-bounded rest
-        distribution. The firmware atomically shifts every entry in its
-        pendulum ring buffer by the current pen_position_rad, so
-        velocity computation continues uninterrupted across the tare.
-
-        Blocks until the Arduino acks (single-byte echo of the command)
-        or `timeout_s` elapses. Returns True on success.
-        """
-        with self._lock:
-            self.ser.write(bytes([CMD_TARE_PENDULUM]))
-            self.ser.flush()
-            resp = self.ser.read(1)
-        return resp == bytes([CMD_TARE_PENDULUM])
+        self._command(CMD_TARE, timeout=timeout_s)
+        return True
 
     def zero_motor(self, *, timeout_s: float = 0.5) -> bool:
-        """Re-zero the motor step counter to the arm's current position.
-
-        Called by `real_env.reset()` after the operator re-centres the arm by
-        hand — the counter is open-loop, so it would otherwise keep reporting
-        the stale pre-move position. Returns True on ack.
-        """
-        with self._lock:
-            self.ser.write(bytes([CMD_ZERO_MOTOR]))
-            self.ser.flush()
-            resp = self.ser.read(1)
-        return resp == bytes([CMD_ZERO_MOTOR])
+        self._command(CMD_ZERO, timeout=timeout_s)
+        return True

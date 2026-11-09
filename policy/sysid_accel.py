@@ -42,6 +42,7 @@ import numpy as np
 import mujoco
 
 from lowlevel_client import LowLevelClient
+from control_safety import confirm_operator_arm
 from pendulum_env import RotaryInvertedPendulumEnv, MAX_ACCEL_RAD_S2, MAX_VELOCITY_RAD_S
 
 
@@ -120,16 +121,8 @@ def run_real(port: str, baud: int, waveform_fn, duration: float,
     with LowLevelClient(port, baud=baud) as client:
         if not client.wait_until_ready():
             raise RuntimeError("LowLevelServer did not respond.")
-        # Motor is disengaged (LowLevelServer boots that way). Prompt the
-        # user to centre the motor and steady the pendulum before each
-        # waveform; press Enter to engage and begin.
-        try:
-            input("  Centre the motor by hand, steady the pendulum, then press Enter to engage and start...")
-        except EOFError:
-            print("  (no stdin; engaging in 2 s)")
-            time.sleep(2.0)
+        client.arm()
         client.set_acceleration(0.0)
-        client.engage_motor()
         time.sleep(0.5)
 
         s0 = client.get_state()
@@ -298,7 +291,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="state-sampling rate in Hz (max ~200 over 2 Mbaud)")
     p.add_argument("--skip-real", action="store_true",
                    help="skip real-rig recording; sim only (for testing the script)")
+    p.add_argument("--arm", action="store_true",
+                   help="opt in to motion; an additional typed confirmation is required")
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
+    if not args.skip_real and not args.arm:
+        p.error("real-rig sysid is disarmed by default; pass --arm to opt in")
+    if not args.skip_real:
+        confirm_operator_arm(requested=True, phrase="ARM SYSID")
 
     todo = []
     if args.waveform in ("step", "all"):
